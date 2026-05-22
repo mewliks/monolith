@@ -14,11 +14,11 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithBlueprintModule` | Registers 89 blueprint actions |
+| `FMonolithBlueprintModule` | Registers 90 blueprint actions |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
-### Actions (89 — namespace: "blueprint")
+### Actions (90 — namespace: "blueprint")
 
 **Read Actions (14)**
 | Action | Params | Description |
@@ -72,7 +72,7 @@
 | `remove_interface` | `asset_path`, `interface_class` | Remove an interface from the Blueprint |
 | `reparent_blueprint` | `asset_path`, `new_parent_class` | Change the Blueprint's parent class |
 
-**Node & Pin Operations (6)**
+**Node & Pin Operations (7)**
 | Action | Params | Description |
 |--------|--------|-------------|
 | `add_node` | `asset_path`, `graph_name`, `node_class`, `position` | Add a node to a graph. Accepts common aliases (e.g. `CallFunction`, `VariableGet`, `ComponentBoundEvent`, `AddDelegate`, `RemoveDelegate`, `ClearDelegate`, `CallDelegate`) and tries `K2_` prefix fallback for function calls |
@@ -81,6 +81,7 @@
 | `disconnect_pins` | `asset_path`, `graph_name`, `source_node`, `source_pin`, `target_node`, `target_pin` | Disconnect two pins |
 | `set_pin_default` | `asset_path`, `graph_name`, `node_id`, `pin_name`, `value` | Set a pin's default value. For PC_Class / PC_Object pins, `value` is resolved to `Pin->DefaultObject`: accepts native class names, object/class paths, or Blueprint class paths (with or without `_C` suffix). Type-checked against `PinSubCategoryObject`. |
 | `set_node_position` | `asset_path`, `graph_name`, `node_id`, `x`, `y` | Set a node's position in the graph |
+| `add_property_access` | `asset_path`, `graph_name`?, `member_class`, `member_name`, `is_setter`? | Author a cross-class `VariableGet`/`Set` reading/writing a UPROPERTY on an arbitrary foreign class (resolved by string via `FindFirstObject<UClass>` — never hardcoded). Calls `FMemberReference::SetExternalMember` then `AllocateDefaultPins` so the value pin resolves to the property's real type (not wildcard); resolves to the declaring class up the hierarchy. Sets a valid NodeGuid. Returns `node_id`, `value_pin_id`, `target_pin_id`. Unblocks reading a property off a passed-in object reference (e.g. iterate array-of-foreign-structs). `target_class` accepted as alias for `member_class`. |
 
 **Compile & Create (5)**
 | Action | Params | Description |

@@ -405,6 +405,24 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("variable_name"),  TEXT("string"), TEXT("Name for the new variable (defaults to pin_name)"))
 			.Optional(TEXT("graph_name"),     TEXT("string"), TEXT("Graph name (searches all graphs if omitted)"))
 			.Build());
+
+	// ---- Phase 1 (gap #11): cross-class property access ----
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_property_access"),
+		TEXT("Author a VariableGet (or VariableSet if is_setter) node that reads/writes a UPROPERTY on an ARBITRARY foreign class — "
+		     "not just the Blueprint's own variables. member_class is resolved by string (FindFirstObject, native-first; accepts U/A prefix or bare name), "
+		     "then VariableReference.SetExternalMember() binds the member so the node's value pin resolves to the property's real type. "
+		     "Unlike node_type='VariableGet' (which is self-context only and produces a wildcard 0-pin node for foreign properties), this binds the external class correctly. "
+		     "Returns node_id plus value_pin_id and target_pin_id (the object/self input the caller must wire via connect_pins to supply the instance to read/write)."),
+		FMonolithActionHandler::CreateStatic(&HandleAddPropertyAccess),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),  TEXT("string"),  TEXT("Blueprint asset path"))
+			.Required(TEXT("member_class"), TEXT("string"), TEXT("Class that owns the property (e.g. 'Item', 'UItem', 'AActor'). Resolved by string, native-first; accepts U/A prefix or bare name."), {TEXT("target_class")})
+			.Required(TEXT("member_name"), TEXT("string"),  TEXT("Name of the UPROPERTY to read/write (e.g. 'Icon')"))
+			.Optional(TEXT("graph_name"),  TEXT("string"),  TEXT("Graph name (defaults to EventGraph)"))
+			.Optional(TEXT("is_setter"),   TEXT("bool"),    TEXT("If true, creates a VariableSet (write) node; otherwise a VariableGet (read) node. Default: false."))
+			.Optional(TEXT("position"),    TEXT("array"),   TEXT("Node position as [x, y] (default: [0, 0])"))
+			.Build());
 }
 
 // ============================================================
@@ -1156,6 +1174,168 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 	{
 		Root->SetStringField(TEXT("warning"),
 			TEXT("Created via generic K2Node fallback — node may require additional configuration via set_pin_default or dedicated handler"));
+	}
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  add_property_access  (Phase 1, gap #11)
+//
+//  Authors a VariableGet/VariableSet bound to a UPROPERTY on an
+//  ARBITRARY foreign class. The plain add_node VariableGet branch
+//  hardcodes SetSelfMember (self-context), which yields a 0-pin
+//  wildcard node for foreign-class properties. Here we resolve the
+//  member's owning class by string (same FindFirstObject mechanism
+//  CallFunction uses) and call SetExternalMember BEFORE
+//  AllocateDefaultPins so the pin types resolve from the member ref.
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddPropertyAccess(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	const FString MemberClassName = Params->GetStringField(TEXT("member_class"));
+	if (MemberClassName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("add_property_access requires 'member_class'"));
+	}
+
+	const FString MemberName = Params->GetStringField(TEXT("member_name"));
+	if (MemberName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("add_property_access requires 'member_name'"));
+	}
+
+	bool bIsSetter = false;
+	Params->TryGetBoolField(TEXT("is_setter"), bIsSetter);
+
+	const FString GraphName = Params->GetStringField(TEXT("graph_name"));
+	UEdGraph* Graph = MonolithBlueprintInternal::FindGraphByName(BP, GraphName);
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Graph not found: %s"), GraphName.IsEmpty() ? TEXT("EventGraph") : *GraphName));
+	}
+
+	// Parse position
+	int32 PosX = 0;
+	int32 PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("position"), PosArray) && PosArray && PosArray->Num() >= 2)
+	{
+		PosX = (int32)(*PosArray)[0]->AsNumber();
+		PosY = (int32)(*PosArray)[1]->AsNumber();
+	}
+
+	// Resolve member_class by string — mirror the CallFunction class-resolution
+	// idiom (native-first, then U-prefix and de-U-prefix variants). ENGINE-GENERIC:
+	// any class, resolved at runtime; never hardcode a sibling-plugin class name.
+	UClass* MemberClass = FindFirstObject<UClass>(*MemberClassName, EFindFirstObjectOptions::NativeFirst);
+	if (!MemberClass && !MemberClassName.StartsWith(TEXT("U")))
+		MemberClass = FindFirstObject<UClass>(*FString::Printf(TEXT("U%s"), *MemberClassName), EFindFirstObjectOptions::NativeFirst);
+	if (!MemberClass && MemberClassName.StartsWith(TEXT("U")))
+		MemberClass = FindFirstObject<UClass>(*MemberClassName.Mid(1), EFindFirstObjectOptions::NativeFirst);
+
+	if (!MemberClass)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Class '%s' not found (also tried U-prefix variants). Pass the property's owning class name."),
+			*MemberClassName));
+	}
+
+	// Warn (but don't fail) if the named property isn't found on the class — the
+	// node still authors usefully, and the caller may target a class whose
+	// property surface isn't loaded the same way; SetExternalMember is the
+	// authoritative bind regardless.
+	const bool bPropertyFound = (MemberClass->FindPropertyByName(FName(*MemberName)) != nullptr);
+
+	// Create the node and bind the EXTERNAL member BEFORE AllocateDefaultPins so
+	// pin types resolve from the member reference (wrong order = wildcard node —
+	// the exact failure this action fixes). Native UPROPERTYs carry no member
+	// GUID, so the 2-arg SetExternalMember overload is correct (MemberReference.h:177).
+	UEdGraphNode* NewNode = nullptr;
+	UEdGraphPin* ValuePin = nullptr;
+	UEdGraphPin* TargetPin = nullptr;
+
+	if (bIsSetter)
+	{
+		UK2Node_VariableSet* VarNode = NewObject<UK2Node_VariableSet>(Graph);
+		VarNode->VariableReference.SetExternalMember(FName(*MemberName), MemberClass);
+		VarNode->NodePosX = PosX;
+		VarNode->NodePosY = PosY;
+		Graph->AddNode(VarNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
+		VarNode->AllocateDefaultPins();
+		NewNode = VarNode;
+	}
+	else
+	{
+		UK2Node_VariableGet* VarNode = NewObject<UK2Node_VariableGet>(Graph);
+		VarNode->VariableReference.SetExternalMember(FName(*MemberName), MemberClass);
+		VarNode->NodePosX = PosX;
+		VarNode->NodePosY = PosY;
+		Graph->AddNode(VarNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
+		VarNode->AllocateDefaultPins();
+		NewNode = VarNode;
+	}
+
+	if (!NewNode)
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to create property-access node — NewObject returned null"));
+	}
+
+	// Ensure a non-zero NodeGuid (gap #15's universal fix lands separately, but
+	// this new node must not ship a zero GUID). EdGraphNode.cpp:791.
+	NewNode->CreateNewGuid();
+
+	// Identify the value pin (the data pin carrying the property's value) and the
+	// target pin (the "self"/object input the caller wires to supply the instance).
+	// For an external-member node the self pin is a PC_Object input named PN_Self;
+	// the value pin is the other non-exec data pin (output for getter, input for setter).
+	const FName SelfPinName = UEdGraphSchema_K2::PN_Self;
+	const EEdGraphPinDirection ValueDir = bIsSetter ? EGPD_Input : EGPD_Output;
+	for (UEdGraphPin* P : NewNode->Pins)
+	{
+		if (!P) continue;
+		if (P->PinName == SelfPinName)
+		{
+			TargetPin = P;
+			continue;
+		}
+		if (!ValuePin && P->Direction == ValueDir && P->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+		{
+			ValuePin = P;
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+	TSharedPtr<FJsonObject> Root = MonolithBlueprintInternal::SerializeNode(NewNode);
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("graph"), Graph->GetName());
+	Root->SetStringField(TEXT("node_id"), NewNode->GetName());
+	Root->SetStringField(TEXT("member_class"), MemberClass->GetName());
+	Root->SetStringField(TEXT("member_name"), MemberName);
+	Root->SetBoolField(TEXT("is_setter"), bIsSetter);
+	Root->SetStringField(TEXT("value_pin_id"), ValuePin ? ValuePin->PinId.ToString() : FString());
+	Root->SetStringField(TEXT("target_pin_id"), TargetPin ? TargetPin->PinId.ToString() : FString());
+	if (ValuePin)
+	{
+		Root->SetStringField(TEXT("value_pin_name"), ValuePin->PinName.ToString());
+	}
+	if (TargetPin)
+	{
+		Root->SetStringField(TEXT("target_pin_name"), TargetPin->PinName.ToString());
+	}
+	if (!bPropertyFound)
+	{
+		Root->SetStringField(TEXT("warning"), FString::Printf(
+			TEXT("Property '%s' was not found on class '%s' via reflection — node was authored with the external member reference, but verify the property name."),
+			*MemberName, *MemberClass->GetName()));
 	}
 	return FMonolithActionResult::Success(Root);
 }
