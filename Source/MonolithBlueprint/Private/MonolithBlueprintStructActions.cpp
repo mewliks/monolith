@@ -632,6 +632,23 @@ FMonolithActionResult FMonolithBlueprintStructActions::HandleAddDataTableRow(con
 		}
 
 		void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(RowData);
+
+		// UserDefinedEnum fields inside a UserDefinedStruct compile to a plain
+		// numeric FProperty (no FEnumProperty), so a friendly/authored enum name
+		// would fail the numeric ImportText below. Resolve such tokens to the
+		// enum's integer value first via the shared walker helper; bare integers
+		// return false and fall through to the existing ImportText path.
+		int64 ResolvedEnumValue = 0;
+		if (FMonolithReflectionWalker::ResolveUserDefinedEnumToken(Prop, ValueStr, ResolvedEnumValue))
+		{
+			if (FNumericProperty* NumProp = CastField<FNumericProperty>(Prop))
+			{
+				NumProp->SetIntPropertyValue(ValuePtr, ResolvedEnumValue);
+				SetFields.Add(FieldName);
+				continue;
+			}
+		}
+
 		const TCHAR* ImportResult = Prop->ImportText_Direct(*ValueStr, ValuePtr, nullptr, PPF_None);
 		if (ImportResult)
 		{
