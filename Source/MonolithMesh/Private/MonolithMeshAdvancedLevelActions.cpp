@@ -736,15 +736,17 @@ FMonolithActionResult FMonolithMeshAdvancedLevelActions::PlaceSpline(const TShar
 
 	SplineActor->Modify();
 
-	// Add a scene root component
+	// Add a scene root component (Static so Static USplineMeshComponents can attach to the hierarchy)
 	USceneComponent* RootComp = NewObject<USceneComponent>(SplineActor, USceneComponent::StaticClass(), TEXT("RootComponent"), RF_Transactional);
+	RootComp->SetMobility(EComponentMobility::Static);
 	RootComp->SetWorldLocation(ActorLocation);
 	SplineActor->SetRootComponent(RootComp);
 	SplineActor->AddInstanceComponent(RootComp);
 	RootComp->RegisterComponent();
 
-	// Add USplineComponent
+	// Add USplineComponent (Static — pipes/cables/railings are placed decoration; matches USplineMeshComponent's default Static mobility)
 	USplineComponent* SplineComp = NewObject<USplineComponent>(SplineActor, USplineComponent::StaticClass(), TEXT("SplineComponent"), RF_Transactional);
+	SplineComp->SetMobility(EComponentMobility::Static);
 	SplineComp->SetupAttachment(RootComp);
 	SplineActor->AddInstanceComponent(SplineComp);
 

@@ -160,16 +160,18 @@ bool FMonolithMeshPlaceSplinePersistenceTest::RunTest(const FString& /*Parameter
 
 	SplineActor->Modify();
 
-	// Root scene component — canonical pattern.
+	// Root scene component — canonical pattern. Static so Static USplineMeshComponents can attach.
 	USceneComponent* RootComp = NewObject<USceneComponent>(
 		SplineActor, USceneComponent::StaticClass(), TEXT("RootComponent"), RF_Transactional);
+	RootComp->SetMobility(EComponentMobility::Static);
 	SplineActor->SetRootComponent(RootComp);
 	SplineActor->AddInstanceComponent(RootComp);
 	RootComp->RegisterComponent();
 
-	// Spline component — canonical pattern.
+	// Spline component — canonical pattern. Static matches USplineMeshComponent's default mobility.
 	USplineComponent* SplineComp = NewObject<USplineComponent>(
 		SplineActor, USplineComponent::StaticClass(), TEXT("SplineComponent"), RF_Transactional);
+	SplineComp->SetMobility(EComponentMobility::Static);
 	SplineComp->SetupAttachment(RootComp);
 	SplineActor->AddInstanceComponent(SplineComp);
 
