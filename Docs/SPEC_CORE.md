@@ -679,6 +679,8 @@ Distinct from §14's domain-specific `detail_level` knob, every MCP action in th
 
 **Warnings channel.** When `_fields` + `_omit` are both non-empty, the post-filter appends a free-text entry to the same `warnings[]` array that K3 unknown-param soft-warns and Survivor D AssetPath rewrites already populate. See §JSON-RPC error catalogue note at §2 — the channel's semantic scope now covers three sources.
 
+**MCP wire engagement (fix landed `f7c5b57`, 2026-05-27).** Claude Code's MCP client serialises array-valued top-level arguments as JSON-encoded STRINGS (e.g. `_fields:"[\"count\"]"` rather than `_fields:["count"]`). `MonolithHttpServer.cpp:691-701` already special-cases this quirk for the `params` key; `MonolithJsonUtils::ReadStringArrayParam` now mirrors the same fallback — native `TryGetArrayField` FIRST (back-compat with automation tests and offline CLI callers), then `TryGetStringField` + `FJsonSerializer::Deserialize` validating `EJson::Array` before populating Out. The `_compact_json` bool read carries a parallel `TryGetStringField` + `FCString::ToBool` fallback. A `UE_LOG(LogMonolith, Verbose, ...)` line fires inside the recovery branches only, making future serialization-shape regressions observable without spamming default verbosity. Live-verified via `monolith_status({_fields:["version","total_actions"]})` returning exactly those two keys.
+
 ### 14.2 Schema-Tagged Param Kinds (`EMonolithParamKind`, Phase 1.0, 2026-05-27)
 
 `FParamSchemaBuilder` (in `MonolithCore/Public/MonolithParamSchema.h`) now stamps an `EMonolithParamKind` enum on each declared param. The enum is serialised onto the per-param schema JSON as a string field `"kind"`, emitted only when non-default to keep `tools/list` bytes lean.
