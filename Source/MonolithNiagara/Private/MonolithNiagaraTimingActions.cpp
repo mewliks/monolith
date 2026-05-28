@@ -94,12 +94,13 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_emitter_loop_profile"),
-		TEXT("Composite write of EmitterState module loop inputs (LoopBehavior, LoopDuration, LoopDelay, LoopCount, bLoopDelayEnabled). Dispatches per-field through set_module_input_value against the canonical module_name=\"EmitterState\". Stateful (UNiagaraEmitter) emitters only — stateless (UNiagaraStatelessEmitter) errors with a hint. Non-fatal coherence issues (e.g. loop_count supplied with loop_behavior='Infinite') return a warnings array; the request still succeeds. Provide at least one of the five payload fields."),
+		TEXT("Composite write of EmitterState loop inputs (LoopBehavior, LoopDuration, LoopDelay, LoopCount, bLoopDelayEnabled, LoopDurationMode). Handles BOTH stateful (UNiagaraEmitter — dispatches per-field through set_module_input_value against module_name=\"EmitterState\") and stateless (UNiagaraStatelessEmitter — direct FProperty reflection on FNiagaraEmitterStateData). Stateless response includes `stateless: true`. `loop_duration_mode` only applies to the stateless branch (stateful path silently ignores it). Non-fatal coherence issues (e.g. loop_count supplied with loop_behavior='Infinite') return a warnings array; the request still succeeds. Provide at least one of the payload fields."),
 		FMonolithActionHandler::CreateStatic(&HandleSetEmitterLoopProfile),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
-			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter handle id/name (same convention as set_module_input_value)"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset OR standalone UNiagaraStatelessEmitter asset"))
+			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Emitter handle id/name (required when asset_path is a UNiagaraSystem; meaningless and ignored when asset_path is a standalone UNiagaraStatelessEmitter)"))
 			.Optional(TEXT("loop_behavior"), TEXT("string"), TEXT("ENiagaraLoopBehavior name: 'Once' | 'Multiple' | 'Infinite'"))
+			.Optional(TEXT("loop_duration_mode"), TEXT("string"), TEXT("ENiagaraLoopDurationMode name: 'Fixed' | 'Infinite' (stateless-only; ignored by stateful path)"))
 			.Optional(TEXT("loop_duration"), TEXT("number"), TEXT("Loop duration in seconds"))
 			.Optional(TEXT("loop_delay"), TEXT("number"), TEXT("Delay in seconds before each loop (requires loop_delay_enabled=true to apply)"))
 			.Optional(TEXT("loop_count"), TEXT("integer"), TEXT("Number of loops (only meaningful when loop_behavior='Multiple')"))
@@ -508,6 +509,262 @@ namespace MonolithNiagaraTimingLocal
 		OutValue = S.ToBool();
 		return true;
 	}
+
+	// Canonicalize ENiagaraLoopDurationMode string (Fixed | Infinite, case-insensitive).
+	// Returns empty on miss.
+	static FString CanonicalizeLoopDurationMode(const FString& Input)
+	{
+		const FString Lower = Input.ToLower();
+		if (Lower == TEXT("fixed"))    return TEXT("Fixed");
+		if (Lower == TEXT("infinite")) return TEXT("Infinite");
+		return FString();
+	}
+
+	// Phase 2 — stateless loop-profile write.
+	//
+	// Cannot include "Stateless/NiagaraStatelessEmitter.h" (Internal/, not on the
+	// MonolithNiagara include path). Access strategy:
+	//   - Caller obtains the stateless emitter as UNiagaraEmitterBase* via
+	//     FNiagaraEmitterHandle::GetEmitterBase() (NiagaraEmitterBase.h is public).
+	//   - All UPROPERTY access on UNiagaraStatelessEmitter::EmitterState
+	//     (FNiagaraEmitterStateData, protected member) routes through
+	//     FindFProperty + ContainerPtrToValuePtr.
+	//   - FNiagaraDistributionRangeFloat literal format verified Phase 2 first-task:
+	//     it inherits FNiagaraDistributionBase (Mode + various) and adds two scalar
+	//     UPROPERTYs (Min, Max). Single-value write = (Min=N,Max=N).
+	//   - Plain PostEditChangeProperty per gotcha hazard #1 (un-versioned class).
+	static FMonolithActionResult WriteStatelessLoopProfile(
+		UObject* StatelessEmitter,
+		const TSharedPtr<FJsonObject>& Params,
+		TArray<TSharedPtr<FJsonValue>>& OutWarnings)
+	{
+		if (!StatelessEmitter)
+			return FMonolithActionResult::Error(TEXT("WriteStatelessLoopProfile: null stateless emitter"));
+
+		FStructProperty* StateProp = FindFProperty<FStructProperty>(
+			StatelessEmitter->GetClass(), TEXT("EmitterState"));
+		if (!StateProp || !StateProp->Struct)
+			return FMonolithActionResult::Error(TEXT(
+				"UPROPERTY 'EmitterState' (FNiagaraEmitterStateData) not found on UNiagaraStatelessEmitter"));
+
+		void* StateData = StateProp->ContainerPtrToValuePtr<void>(StatelessEmitter);
+		UScriptStruct* StateStruct = StateProp->Struct;
+
+		// Collect optional payload fields.
+		const TSharedPtr<FJsonValue> BehaviorJV       = Params->TryGetField(TEXT("loop_behavior"));
+		const TSharedPtr<FJsonValue> DurationModeJV   = Params->TryGetField(TEXT("loop_duration_mode"));
+		const TSharedPtr<FJsonValue> DurationJV       = Params->TryGetField(TEXT("loop_duration"));
+		const TSharedPtr<FJsonValue> DelayJV          = Params->TryGetField(TEXT("loop_delay"));
+		const TSharedPtr<FJsonValue> CountJV          = Params->TryGetField(TEXT("loop_count"));
+		const TSharedPtr<FJsonValue> DelayEnabledJV   = Params->TryGetField(TEXT("loop_delay_enabled"));
+
+		// Canonicalize enum strings up-front so we can early-reject before mutation.
+		FString BehaviorCanonical;
+		if (BehaviorJV.IsValid() && BehaviorJV->Type == EJson::String)
+		{
+			BehaviorCanonical = CanonicalizeLoopBehavior(BehaviorJV->AsString());
+			if (BehaviorCanonical.IsEmpty())
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Unknown loop_behavior '%s'. Valid: 'Once' | 'Multiple' | 'Infinite'"),
+					*BehaviorJV->AsString()));
+			}
+		}
+		FString DurationModeCanonical;
+		if (DurationModeJV.IsValid() && DurationModeJV->Type == EJson::String)
+		{
+			DurationModeCanonical = CanonicalizeLoopDurationMode(DurationModeJV->AsString());
+			if (DurationModeCanonical.IsEmpty())
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Unknown loop_duration_mode '%s'. Valid: 'Fixed' | 'Infinite'"),
+					*DurationModeJV->AsString()));
+			}
+		}
+
+		// Coherence warnings — mirror the stateful path's policy (non-fatal).
+		if (CountJV.IsValid() && CountJV->Type == EJson::Number)
+		{
+			const bool bBehaviorIsMultiple = (BehaviorCanonical == TEXT("Multiple"));
+			if (BehaviorJV.IsValid() && !bBehaviorIsMultiple)
+			{
+				OutWarnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+					TEXT("loop_count supplied with loop_behavior='%s' — LoopCount only applies when behavior is 'Multiple'."),
+					*BehaviorCanonical)));
+			}
+		}
+		if (DelayJV.IsValid() && DelayJV->Type == EJson::Number)
+		{
+			const bool bDelayExplicitlyEnabled = DelayEnabledJV.IsValid() &&
+				DelayEnabledJV->Type == EJson::Boolean && DelayEnabledJV->AsBool();
+			if (!bDelayExplicitlyEnabled)
+			{
+				OutWarnings.Add(MakeShared<FJsonValueString>(TEXT(
+					"loop_delay supplied without loop_delay_enabled=true — the LoopDelay value will be set but bLoopDelayEnabled may suppress it.")));
+			}
+		}
+
+		// Re-init owning system on scope exit. SetDestroyOnAdd(true) per gotcha hazard #2
+		// (stateless has no script — Add+destructor pattern is the re-init mechanism).
+		FNiagaraSystemUpdateContext UpdateContext;
+		UpdateContext.SetDestroyOnAdd(true);
+		if (UNiagaraSystem* OwnerSystem = StatelessEmitter->GetTypedOuter<UNiagaraSystem>())
+		{
+			UpdateContext.Add(OwnerSystem, true);
+		}
+
+		StatelessEmitter->Modify();
+
+		// Hoist a single PreEditChange on the OUTER FStructProperty (owned by the
+		// UNiagaraStatelessEmitter UClass). The inner FNiagaraEmitterStateData fields
+		// are owned by a UScriptStruct, NOT a UClass — invoking PostEditChangeProperty
+		// on them trips GetOwner<UClass>() assert in UE 5.7 UnrealType.h:754. Standard
+		// UE pattern is to notify on the struct property, not on its inner fields.
+		StatelessEmitter->PreEditChange(StateProp);
+
+		auto FireEditChange = [](FProperty* /*Prop*/)
+		{
+			// Intentionally no-op. Per-field PreEditChange/PostEditChangeProperty
+			// would assert because inner properties are UScriptStruct-owned.
+			// Single PostEditChangeProperty on the outer StateProp fires after all
+			// writes complete (see end of this function).
+		};
+
+		auto WriteRangeFloatField = [&](const TCHAR* FieldName, double Value, const TCHAR* JsonName) -> bool
+		{
+			FStructProperty* Prop = FindFProperty<FStructProperty>(StateStruct, FieldName);
+			if (!Prop)
+			{
+				OutWarnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+					TEXT("UPROPERTY '%s' not found on FNiagaraEmitterStateData — skipped."),
+					FieldName)));
+				return false;
+			}
+			void* RangeData = Prop->ContainerPtrToValuePtr<void>(StateData);
+			// Single-value -> (Min=N,Max=N). Verified Phase 2 first-task: struct layout
+			// is `float Min` + `float Max` in FNiagaraDistributionRangeFloat, plus
+			// inherited Mode/etc. from FNiagaraDistributionBase (defaults are fine).
+			const FString Literal = FString::Printf(TEXT("(Min=%f,Max=%f)"), Value, Value);
+			const TCHAR* Result = Prop->ImportText_Direct(*Literal, RangeData, StatelessEmitter, PPF_None, GError);
+			if (!Result)
+			{
+				OutWarnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+					TEXT("Failed to ImportText_Direct for %s (literal '%s')."), JsonName, *Literal)));
+				return false;
+			}
+			FireEditChange(Prop);
+			return true;
+		};
+
+		// LoopBehavior — UByteProperty (enum) — ImportText_Direct with canonical name.
+		if (!BehaviorCanonical.IsEmpty())
+		{
+			FProperty* Prop = StateStruct->FindPropertyByName(TEXT("LoopBehavior"));
+			if (!Prop)
+			{
+				OutWarnings.Add(MakeShared<FJsonValueString>(TEXT(
+					"UPROPERTY 'LoopBehavior' not found on FNiagaraEmitterStateData — skipped.")));
+			}
+			else
+			{
+				void* FieldData = Prop->ContainerPtrToValuePtr<void>(StateData);
+				const TCHAR* R = Prop->ImportText_Direct(*BehaviorCanonical, FieldData, StatelessEmitter, PPF_None, GError);
+				if (!R)
+				{
+					OutWarnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+						TEXT("Failed to ImportText_Direct LoopBehavior='%s'."), *BehaviorCanonical)));
+				}
+				else
+				{
+					FireEditChange(Prop);
+				}
+			}
+		}
+
+		// LoopDurationMode — enum, same pattern.
+		if (!DurationModeCanonical.IsEmpty())
+		{
+			FProperty* Prop = StateStruct->FindPropertyByName(TEXT("LoopDurationMode"));
+			if (!Prop)
+			{
+				OutWarnings.Add(MakeShared<FJsonValueString>(TEXT(
+					"UPROPERTY 'LoopDurationMode' not found on FNiagaraEmitterStateData — skipped.")));
+			}
+			else
+			{
+				void* FieldData = Prop->ContainerPtrToValuePtr<void>(StateData);
+				const TCHAR* R = Prop->ImportText_Direct(*DurationModeCanonical, FieldData, StatelessEmitter, PPF_None, GError);
+				if (!R)
+				{
+					OutWarnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+						TEXT("Failed to ImportText_Direct LoopDurationMode='%s'."), *DurationModeCanonical)));
+				}
+				else
+				{
+					FireEditChange(Prop);
+				}
+			}
+		}
+
+		// LoopCount — FIntProperty, plain SetPropertyValue_InContainer.
+		if (CountJV.IsValid() && CountJV->Type == EJson::Number)
+		{
+			FIntProperty* Prop = FindFProperty<FIntProperty>(StateStruct, TEXT("LoopCount"));
+			if (!Prop)
+			{
+				OutWarnings.Add(MakeShared<FJsonValueString>(TEXT(
+					"UPROPERTY 'LoopCount' not found on FNiagaraEmitterStateData — skipped.")));
+			}
+			else
+			{
+				Prop->SetPropertyValue_InContainer(StateData, static_cast<int32>(CountJV->AsNumber()));
+				FireEditChange(Prop);
+			}
+		}
+
+		// LoopDuration / LoopDelay — FNiagaraDistributionRangeFloat structs.
+		if (DurationJV.IsValid() && DurationJV->Type == EJson::Number)
+		{
+			WriteRangeFloatField(TEXT("LoopDuration"), DurationJV->AsNumber(), TEXT("loop_duration"));
+		}
+		if (DelayJV.IsValid() && DelayJV->Type == EJson::Number)
+		{
+			WriteRangeFloatField(TEXT("LoopDelay"), DelayJV->AsNumber(), TEXT("loop_delay"));
+		}
+
+		// bLoopDelayEnabled — FBoolProperty (uint32:1 bitfield), SetPropertyValue_InContainer.
+		if (DelayEnabledJV.IsValid() && DelayEnabledJV->Type == EJson::Boolean)
+		{
+			FBoolProperty* Prop = FindFProperty<FBoolProperty>(StateStruct, TEXT("bLoopDelayEnabled"));
+			if (!Prop)
+			{
+				OutWarnings.Add(MakeShared<FJsonValueString>(TEXT(
+					"UPROPERTY 'bLoopDelayEnabled' not found on FNiagaraEmitterStateData — skipped.")));
+			}
+			else
+			{
+				Prop->SetPropertyValue_InContainer(StateData, DelayEnabledJV->AsBool());
+				FireEditChange(Prop);
+			}
+		}
+
+		// Single PostEditChangeProperty on the outer FStructProperty (UClass-owned).
+		// Mirrors the hoisted PreEditChange above. EPropertyChangeType::ValueSet
+		// matches what per-field SetValue paths would have fired.
+		{
+			FPropertyChangedEvent PCE(StateProp, EPropertyChangeType::ValueSet);
+			StatelessEmitter->PostEditChangeProperty(PCE);
+		}
+
+		// UpdateContext destructor at scope exit triggers system re-init.
+		TSharedRef<FJsonObject> Resp = MakeShared<FJsonObject>();
+		Resp->SetBoolField(TEXT("success"), true);
+		Resp->SetStringField(TEXT("asset_path"), GetAssetPath(Params));
+		Resp->SetStringField(TEXT("emitter"), Params->GetStringField(TEXT("emitter")));
+		Resp->SetBoolField(TEXT("stateless"), true);
+		Resp->SetArrayField(TEXT("warnings"), OutWarnings);
+		return FMonolithActionResult::Success(Resp);
+	}
 } // namespace MonolithNiagaraTimingLocal
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetEmitterLoopProfile(const TSharedPtr<FJsonObject>& Params)
@@ -518,9 +775,9 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetEmitterLoopProfile
 	if (SystemPath.IsEmpty())
 		return FMonolithActionResult::Error(TEXT("Missing required field: asset_path"));
 
+	// Emitter is optional NOW — only required for system-asset path. Validated below.
 	FString Emitter;
-	if (!Params->TryGetStringField(TEXT("emitter"), Emitter) || Emitter.IsEmpty())
-		return FMonolithActionResult::Error(TEXT("Missing required field: emitter (string)"));
+	Params->TryGetStringField(TEXT("emitter"), Emitter);
 
 	// Collect optional payload fields up-front so we can early-reject "no fields supplied".
 	const TSharedPtr<FJsonValue> BehaviorJV       = Params->TryGetField(TEXT("loop_behavior"));
@@ -528,15 +785,40 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetEmitterLoopProfile
 	const TSharedPtr<FJsonValue> DelayJV          = Params->TryGetField(TEXT("loop_delay"));
 	const TSharedPtr<FJsonValue> CountJV          = Params->TryGetField(TEXT("loop_count"));
 	const TSharedPtr<FJsonValue> DelayEnabledJV   = Params->TryGetField(TEXT("loop_delay_enabled"));
+	const TSharedPtr<FJsonValue> DurationModeJV   = Params->TryGetField(TEXT("loop_duration_mode"));
 
 	const bool bAnyField =
 		(BehaviorJV.IsValid()     && BehaviorJV->Type     == EJson::String)  ||
 		(DurationJV.IsValid()     && DurationJV->Type     == EJson::Number)  ||
 		(DelayJV.IsValid()        && DelayJV->Type        == EJson::Number)  ||
 		(CountJV.IsValid()        && CountJV->Type        == EJson::Number)  ||
-		(DelayEnabledJV.IsValid() && DelayEnabledJV->Type == EJson::Boolean);
+		(DelayEnabledJV.IsValid() && DelayEnabledJV->Type == EJson::Boolean) ||
+		(DurationModeJV.IsValid() && DurationModeJV->Type == EJson::String);
 	if (!bAnyField)
-		return FMonolithActionResult::Error(TEXT("Must supply at least one of: loop_behavior, loop_duration, loop_delay, loop_count, loop_delay_enabled"));
+		return FMonolithActionResult::Error(TEXT("Must supply at least one of: loop_behavior, loop_duration_mode, loop_duration, loop_delay, loop_count, loop_delay_enabled"));
+
+	// Standalone UNiagaraStatelessEmitter dispatch — load the asset path as a bare
+	// UObject and class-name-string-match against "NiagaraStatelessEmitter". The
+	// stateless header lives in Niagara's Internal/ tree (not on our include path),
+	// so we cannot static_cast<UNiagaraStatelessEmitter*> here. Class-name match
+	// is sufficient: WriteStatelessLoopProfile reflects on EmitterState via
+	// FindFProperty and never needs the concrete type.
+	if (UObject* LoadedObject = StaticLoadObject(UObject::StaticClass(), nullptr, *SystemPath))
+	{
+		if (LoadedObject->GetClass() &&
+			LoadedObject->GetClass()->GetName() == TEXT("NiagaraStatelessEmitter"))
+		{
+			// `emitter` is meaningless on standalone stateless asset — accept absent
+			// or "self" silently. Any other value is ignored (no error: schema-doc
+			// already says it's meaningless for this branch).
+			TArray<TSharedPtr<FJsonValue>> StatelessWarnings;
+			return WriteStatelessLoopProfile(LoadedObject, Params, StatelessWarnings);
+		}
+	}
+
+	// System-asset path. `emitter` is mandatory here.
+	if (Emitter.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("Missing required field: emitter (string) — required when asset_path is a UNiagaraSystem"));
 
 	UNiagaraSystem* System = LoadSystem(SystemPath);
 	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
@@ -562,13 +844,14 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetEmitterLoopProfile
 		return FMonolithActionResult::Error(FString::Printf(
 			TEXT("Emitter '%s' not found. Use list_emitters to get valid emitter names or GUIDs."), *Emitter));
 
-	// Stateless emitter early-out — checked via FNiagaraEmitterHandle::GetStatelessEmitter()
-	// (forward-declared return type means no Internal/Stateless/ header needed).
+	// Stateless emitter dispatch — Phase 2. The stateless branch writes EmitterState
+	// UPROPERTYs via reflection (UNiagaraStatelessEmitter header is in Internal/ and
+	// not on our include path; we route via GetEmitterBase() to get a UObject*).
 	if (Handles[EIdx].GetStatelessEmitter() != nullptr)
 	{
-		return FMonolithActionResult::Error(TEXT(
-			"Stateless emitter (UNiagaraStatelessEmitter) detected — use set_stateless_loop_profile "
-			"(Phase 3 — coming in a future release). set_emitter_loop_profile only supports stateful emitters."));
+		UObject* StatelessEmitter = Handles[EIdx].GetEmitterBase();
+		TArray<TSharedPtr<FJsonValue>> StatelessWarnings;
+		return WriteStatelessLoopProfile(StatelessEmitter, Params, StatelessWarnings);
 	}
 
 	TArray<TSharedPtr<FJsonValue>> Warnings;
@@ -583,6 +866,13 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetEmitterLoopProfile
 				TEXT("Unknown loop_behavior '%s'. Valid: 'Once' | 'Multiple' | 'Infinite'"),
 				*BehaviorJV->AsString()));
 		}
+	}
+
+	// loop_duration_mode is stateless-only — warn if supplied to the stateful path.
+	if (DurationModeJV.IsValid() && DurationModeJV->Type == EJson::String)
+	{
+		Warnings.Add(MakeShared<FJsonValueString>(TEXT(
+			"loop_duration_mode supplied to a stateful emitter — ignored. The stateful EmitterState module does not expose a LoopDurationMode user input.")));
 	}
 
 	// Non-fatal coherence warnings (per design Q1 — warnings array, not errors).
