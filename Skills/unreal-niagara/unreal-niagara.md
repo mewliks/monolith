@@ -5,7 +5,7 @@ description: Use when creating, editing, or inspecting Niagara particle systems 
 
 # Unreal Niagara VFX Workflows
 
-You have access to **Monolith** with 117 Niagara actions via `niagara_query()`.
+You have access to **Monolith** with 119 Niagara actions via `niagara_query()`.
 
 ## Discovery
 
@@ -173,11 +173,18 @@ Composite, intent-named writers that replace scattered timing edits (`set_system
 | `set_warmup_profile` | `asset_path`, `warmup_time`, `warmup_tick_delta`? | Composite warmup write. Returns the engine-resolved (time, count, delta) triple so you can observe the ResolveWarmupTickCount snap |
 | `set_fixed_tick_delta` | `asset_path`, `enabled`, `fixed_delta_time`? | Toggle bFixedTickDelta with optional delta value |
 | `set_require_current_frame_data` | `asset_path`, `enabled` | Toggle bRequireCurrentFrameData |
-| `set_emitter_loop_profile` | `asset_path`, `emitter`, `loop_behavior`?, `loop_duration`?, `loop_delay`?, `loop_count`?, `loop_delay_enabled`? | Composite EmitterState loop write. `loop_behavior`: `Once`/`Infinite`/`Multiple`. Stateless emitters early-out with a hint |
-| `get_emitter_timing_summary` | `asset_path`, `emitter`? | Read aggregator: loop topology + sim stages + InitializeParticle lifetime fields. Omit `emitter` for all |
+| `set_emitter_loop_profile` | `asset_path`, `emitter`?, `loop_behavior`?, `loop_duration`?, `loop_delay`?, `loop_count`?, `loop_delay_enabled`?, `loop_duration_mode`? | Composite EmitterState loop write. `loop_behavior`: `Once`/`Infinite`/`Multiple`. **Stateless-aware:** if `asset_path` resolves to a `UNiagaraStatelessEmitter`, omit `emitter` and the action dispatches into the stateless reflection write-path (response includes `stateless: true`). `loop_duration_mode` (`Fixed`/`Infinite`, maps to `ENiagaraLoopDurationMode`) is stateless-only — stateful path warns if supplied |
+| `get_emitter_timing_summary` | `asset_path`, `emitter`? | Read aggregator: loop topology + sim stages + InitializeParticle lifetime fields. Omit `emitter` for all. **Stateless-aware:** standalone `UNiagaraStatelessEmitter` asset paths return `stateless: true`, `null` lifetime fields, and `sim_stages: []` |
 | `set_sim_stage_iteration_count` | `asset_path`, `emitter`, `stage_index`/`stage_name`, `iteration_count` | Alias over set_simulation_stage_property for NumIterations |
 | `set_sim_stage_execute_behavior` | `asset_path`, `emitter`, `stage_index`/`stage_name`, `execute_behavior` | Alias for ExecuteBehavior. `Always`/`OnSimulationReset`/`NotOnSimulationReset` |
 | `set_particle_lifetime` | `asset_path`, `emitter`, `min`, `max`? | Convenience write to InitializeParticle. `min` only → Direct mode constant. `min` + `max` → Random mode min/max |
+
+### Stateless Emitters (1)
+`UNiagaraStatelessEmitter` (Lightweight Emitter) is a standalone emitter storage class distinct from `UNiagaraEmitter`. Lives outside the Niagara System wrapper — pass the asset path directly to the stateless-aware actions below. `set_emitter_loop_profile` and `get_emitter_timing_summary` (above) auto-detect standalone stateless assets and route to a reflection-based write/read against the protected `EmitterState` (`FNiagaraEmitterStateData`) UPROPERTY.
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `create_stateless_emitter` | `save_path` | Create a standalone `UNiagaraStatelessEmitter` (Lightweight Emitter) asset. No system wrapper needed — pair with the stateless-aware branches of `set_emitter_loop_profile` and `get_emitter_timing_summary` |
 
 ### NPC (Niagara Parameter Collections) (5)
 | Action | Key Params | Purpose |
@@ -341,7 +348,36 @@ niagara_query({ action: "set_emitter_loop_profile", params: {
 }})
 ```
 
-Stateless emitters (no EmitterState module) early-out with a `hint` field — no error, no partial write.
+### Create + configure a Lightweight Emitter end-to-end
+
+`UNiagaraStatelessEmitter` (Lightweight Emitter) is a separate asset class — no `UNiagaraSystem` wrapper needed. Pass the standalone asset path directly to the stateless-aware temporal-control actions; they detect the class and route to a reflection-based write/read against the protected `EmitterState` (`FNiagaraEmitterStateData`) UPROPERTY.
+
+```
+// 1. Create the asset
+niagara_query({ action: "create_stateless_emitter", params: {
+  save_path: "/Game/MyEmitters/NSE_Foo"
+}})
+
+// 2. Configure loop topology — no `emitter` param needed for standalone stateless assets
+niagara_query({ action: "set_emitter_loop_profile", params: {
+  asset_path: "/Game/MyEmitters/NSE_Foo",
+  loop_behavior: "Multiple",
+  loop_duration: 2.5,
+  loop_count: 3,
+  loop_delay: 0.5,
+  loop_delay_enabled: true,
+  loop_duration_mode: "Fixed"
+}})
+// Response includes `stateless: true`
+
+// 3. Round-trip verification
+niagara_query({ action: "get_emitter_timing_summary", params: {
+  asset_path: "/Game/MyEmitters/NSE_Foo"
+}})
+// Response: `stateless: true`, loop topology populated, lifetime fields null, sim_stages: []
+```
+
+`loop_duration_mode` (`"Fixed"` / `"Infinite"` — maps to `ENiagaraLoopDurationMode`) is stateless-only. The stateful `EmitterState` module has no equivalent input; supplying it on a stateful path emits a warning.
 
 ## Working with Particle Materials
 
