@@ -765,6 +765,124 @@ namespace MonolithNiagaraTimingLocal
 		Resp->SetArrayField(TEXT("warnings"), OutWarnings);
 		return FMonolithActionResult::Success(Resp);
 	}
+
+	// Phase 3 — stateless loop-profile read. Mirror of WriteStatelessLoopProfile
+	// (lines 536-767 of this file). Returns the per-emitter JSON object the
+	// aggregator emits; caller chooses whether to embed in a single-element
+	// `emitters` array (standalone branch) or append to the system loop.
+	//
+	// Access strategy identical to the write helper:
+	//   - StatelessEmitter is a bare UObject* (concrete UNiagaraStatelessEmitter
+	//     header lives in Internal/, not on our include path).
+	//   - All field access via FindFProperty + ContainerPtrToValuePtr.
+	//   - FNiagaraDistributionRangeFloat.Min is the canonical scalar (the write
+	//     helper writes (Min=N,Max=N), so for our writes Min == Max).
+	//   - lifetime fields are NOT in scope for Phase 3 — they live on a
+	//     different stateless surface (modules) and are deferred. Return null.
+	static TSharedPtr<FJsonObject> ReadStatelessLoopProfile(UObject* StatelessEmitter)
+	{
+		TSharedRef<FJsonObject> EObj = MakeShared<FJsonObject>();
+		EObj->SetStringField(TEXT("name"), StatelessEmitter ? StatelessEmitter->GetName() : FString());
+		EObj->SetNumberField(TEXT("index"), 0);
+		EObj->SetBoolField(TEXT("stateless"), true);
+
+		// Helpers for nullable surfaces (mirror aggregator shape).
+		auto SetNull = [&EObj](const TCHAR* Field)
+		{
+			EObj->SetField(Field, MakeShared<FJsonValueNull>());
+		};
+
+		// Stateless emitters have no sim stages by design — explicit empty array.
+		EObj->SetArrayField(TEXT("sim_stages"), TArray<TSharedPtr<FJsonValue>>());
+
+		// Lifetime surfaces deferred (different module-level path, not in Phase 3 scope).
+		SetNull(TEXT("lifetime"));
+		SetNull(TEXT("lifetime_mode"));
+		SetNull(TEXT("lifetime_min"));
+		SetNull(TEXT("lifetime_max"));
+
+		if (!StatelessEmitter)
+		{
+			SetNull(TEXT("loop_behavior"));
+			SetNull(TEXT("loop_count"));
+			SetNull(TEXT("loop_duration_mode"));
+			SetNull(TEXT("loop_duration"));
+			SetNull(TEXT("loop_delay"));
+			SetNull(TEXT("loop_delay_enabled"));
+			return EObj;
+		}
+
+		FStructProperty* StateProp = FindFProperty<FStructProperty>(
+			StatelessEmitter->GetClass(), TEXT("EmitterState"));
+		if (!StateProp || !StateProp->Struct)
+		{
+			SetNull(TEXT("loop_behavior"));
+			SetNull(TEXT("loop_count"));
+			SetNull(TEXT("loop_duration_mode"));
+			SetNull(TEXT("loop_duration"));
+			SetNull(TEXT("loop_delay"));
+			SetNull(TEXT("loop_delay_enabled"));
+			return EObj;
+		}
+
+		const void* StateData = StateProp->ContainerPtrToValuePtr<void>(StatelessEmitter);
+		UScriptStruct* StateStruct = StateProp->Struct;
+
+		// Enum reader — ExportTextItem_Direct emits the enum element name; we
+		// strip the "EnumType::" prefix if the serializer included it so the
+		// surface ("Multiple", "Fixed") matches what the write helper accepts.
+		auto ReadEnumField = [&](const TCHAR* FieldName, const TCHAR* JsonField)
+		{
+			FProperty* Prop = StateStruct->FindPropertyByName(FieldName);
+			if (!Prop) { SetNull(JsonField); return; }
+			FString ValStr;
+			Prop->ExportTextItem_Direct(
+				ValStr,
+				Prop->ContainerPtrToValuePtr<void>(StateData),
+				nullptr, StatelessEmitter, PPF_None);
+			int32 ColonIdx = INDEX_NONE;
+			if (ValStr.FindLastChar(TEXT(':'), ColonIdx) && ColonIdx + 1 < ValStr.Len())
+			{
+				ValStr = ValStr.Mid(ColonIdx + 1);
+			}
+			EObj->SetStringField(JsonField, ValStr);
+		};
+
+		ReadEnumField(TEXT("LoopBehavior"),     TEXT("loop_behavior"));
+		ReadEnumField(TEXT("LoopDurationMode"), TEXT("loop_duration_mode"));
+
+		// LoopCount — FIntProperty.
+		if (FIntProperty* CountProp = FindFProperty<FIntProperty>(StateStruct, TEXT("LoopCount")))
+		{
+			EObj->SetNumberField(TEXT("loop_count"),
+				CountProp->GetPropertyValue_InContainer(StateData));
+		}
+		else { SetNull(TEXT("loop_count")); }
+
+		// LoopDuration / LoopDelay — FNiagaraDistributionRangeFloat. Read Min as
+		// the canonical scalar (write helper sets Min == Max for constant writes).
+		auto ReadRangeFloatField = [&](const TCHAR* FieldName, const TCHAR* JsonField)
+		{
+			FStructProperty* RangeProp = FindFProperty<FStructProperty>(StateStruct, FieldName);
+			if (!RangeProp || !RangeProp->Struct) { SetNull(JsonField); return; }
+			const void* RangeData = RangeProp->ContainerPtrToValuePtr<void>(StateData);
+			FFloatProperty* MinProp = FindFProperty<FFloatProperty>(RangeProp->Struct, TEXT("Min"));
+			if (!MinProp) { SetNull(JsonField); return; }
+			EObj->SetNumberField(JsonField, MinProp->GetPropertyValue_InContainer(RangeData));
+		};
+		ReadRangeFloatField(TEXT("LoopDuration"), TEXT("loop_duration"));
+		ReadRangeFloatField(TEXT("LoopDelay"),    TEXT("loop_delay"));
+
+		// bLoopDelayEnabled — FBoolProperty (uint32:1 bitfield).
+		if (FBoolProperty* DelayEnabledProp = FindFProperty<FBoolProperty>(StateStruct, TEXT("bLoopDelayEnabled")))
+		{
+			EObj->SetBoolField(TEXT("loop_delay_enabled"),
+				DelayEnabledProp->GetPropertyValue_InContainer(StateData));
+		}
+		else { SetNull(TEXT("loop_delay_enabled")); }
+
+		return EObj;
+	}
 } // namespace MonolithNiagaraTimingLocal
 
 FMonolithActionResult FMonolithNiagaraTimingActions::HandleSetEmitterLoopProfile(const TSharedPtr<FJsonObject>& Params)
@@ -973,6 +1091,25 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleGetEmitterTimingSumma
 	FString FilterEmitter;
 	Params->TryGetStringField(TEXT("emitter"), FilterEmitter);
 
+	// Standalone UNiagaraStatelessEmitter dispatch — mirrors the write-side
+	// branch in HandleSetEmitterLoopProfile (lines 800-817). Class-name string
+	// match because UNiagaraStatelessEmitter lives in Niagara's Internal/ tree
+	// (not on our include path). ReadStatelessLoopProfile uses reflection only.
+	if (UObject* LoadedObject = StaticLoadObject(UObject::StaticClass(), nullptr, *SystemPath))
+	{
+		if (LoadedObject->GetClass() &&
+			LoadedObject->GetClass()->GetName() == TEXT("NiagaraStatelessEmitter"))
+		{
+			TArray<TSharedPtr<FJsonValue>> EmittersArr;
+			EmittersArr.Add(MakeShared<FJsonValueObject>(
+				ReadStatelessLoopProfile(LoadedObject).ToSharedRef()));
+			TSharedRef<FJsonObject> Resp = MakeShared<FJsonObject>();
+			Resp->SetStringField(TEXT("asset_path"), SystemPath);
+			Resp->SetArrayField(TEXT("emitters"), EmittersArr);
+			return SuccessObj(Resp);
+		}
+	}
+
 	UNiagaraSystem* System = LoadSystem(SystemPath);
 	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
 
@@ -994,19 +1131,23 @@ FMonolithActionResult FMonolithNiagaraTimingActions::HandleGetEmitterTimingSumma
 			if (!bMatch) continue;
 		}
 
+		// Stateless emitters dispatch to the Phase 3 reflection reader — it
+		// returns the full per-emitter shape (loop_behavior/count/duration/etc.)
+		// instead of the prior thin {stateless:true} stub. Re-stamp name+index
+		// so the helper's defaults (own name, index=0) don't leak through.
+		if (H.GetStatelessEmitter() != nullptr)
+		{
+			TSharedPtr<FJsonObject> StatelessObj =
+				ReadStatelessLoopProfile(H.GetEmitterBase());
+			StatelessObj->SetStringField(TEXT("name"), HandleName);
+			StatelessObj->SetNumberField(TEXT("index"), i);
+			EmittersArr.Add(MakeShared<FJsonValueObject>(StatelessObj.ToSharedRef()));
+			continue;
+		}
+
 		TSharedRef<FJsonObject> EObj = MakeShared<FJsonObject>();
 		EObj->SetStringField(TEXT("name"), HandleName);
 		EObj->SetNumberField(TEXT("index"), i);
-
-		// Stateless emitters short-circuit — they don't expose EmitterState/sim
-		// stages the same way; aggregator returns a thin object with `stateless=true`
-		// so callers can branch.
-		if (H.GetStatelessEmitter() != nullptr)
-		{
-			EObj->SetBoolField(TEXT("stateless"), true);
-			EmittersArr.Add(MakeShared<FJsonValueObject>(EObj));
-			continue;
-		}
 		EObj->SetBoolField(TEXT("stateless"), false);
 
 		// --- EmitterState loop inputs (read via get_module_input_value) ---
