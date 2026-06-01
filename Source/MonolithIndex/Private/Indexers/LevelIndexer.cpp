@@ -115,6 +115,22 @@ bool FLevelIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset
 					}
 				}
 
+				// CleanupWorld deinitializes ALL world subsystems via SubsystemCollection.Deinitialize(),
+				// not just WorldPartition. LoadPackage populates the subsystem collection without InitWorld,
+				// leaving subsystems like ULandscapeSubsystem bInitialized; GC then trips the handled ensure in
+				// UTickableWorldSubsystem::BeginDestroy. This generalizes the WP-only #20/#27 fix to the whole class (#67).
+				{
+					// One-time diagnostic: surface the actual bIsWorldInitialized value for these LoadPackage'd worlds.
+					static bool bLoggedOnce = false;
+					if (!bLoggedOnce)
+					{
+						bLoggedOnce = true;
+						UE_LOG(LogMonolithIndex, Verbose, TEXT("[LevelIndexer] CleanupWorld: World->IsInitialized()=%d for %s"),
+							World->IsInitialized() ? 1 : 0, *World->GetName());
+					}
+					World->CleanupWorld();
+				}
+
 				// Mark world/package for unloading after indexing
 				FMonolithMemoryHelper::TryUnloadPackage(World);
 			}
