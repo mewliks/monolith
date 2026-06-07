@@ -1124,6 +1124,7 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Destination IK Retargeter asset path (e.g. /Game/Path/RTG_MyRetarget)"))
 			.Optional(TEXT("source_ik_rig_path"), TEXT("string"), TEXT("Source IK Rig asset path"))
 			.Optional(TEXT("target_ik_rig_path"), TEXT("string"), TEXT("Target IK Rig asset path"))
+			.Optional(TEXT("auto_map"), TEXT("string"), TEXT("Chain auto-map mode when both rigs are set: 'fuzzy' (default, name-similarity) or 'exact'"), TEXT("fuzzy"))
 			.Build());
 	Registry.RegisterAction(TEXT("animation"), TEXT("set_retargeter_rigs"),
 		TEXT("Set the source and target IK Rigs (and optional preview meshes) on an existing IK Retargeter."),
@@ -1134,6 +1135,7 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("target_ik_rig_path"), TEXT("string"), TEXT("Target IK Rig asset path"))
 			.Optional(TEXT("source_preview_mesh"), TEXT("string"), TEXT("Source preview skeletal mesh path"))
 			.Optional(TEXT("target_preview_mesh"), TEXT("string"), TEXT("Target preview skeletal mesh path"))
+			.Optional(TEXT("auto_map"), TEXT("string"), TEXT("Chain auto-map mode for seeded ops: 'fuzzy' (default) or 'exact'"), TEXT("fuzzy"))
 			.Build());
 	Registry.RegisterAction(TEXT("animation"), TEXT("batch_retarget_animations"),
 		TEXT("Duplicate and retarget a list of animation assets cross-skeleton using an IK Retargeter. Outputs new clips bound to the target skeleton into output_folder."),
@@ -1150,6 +1152,7 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("replace"), TEXT("string"), TEXT("Replacement for the 'search' substring"))
 			.Optional(TEXT("include_referenced"), TEXT("bool"), TEXT("Also retarget assets referenced by the inputs (default: false)"), TEXT("false"))
 			.Optional(TEXT("overwrite"), TEXT("bool"), TEXT("Overwrite existing output files instead of creating uniquely-named copies (default: false)"), TEXT("false"))
+			.Optional(TEXT("auto_map"), TEXT("string"), TEXT("Chain auto-map mode if ops must be seeded on run: 'fuzzy' (default) or 'exact'"), TEXT("fuzzy"))
 			.Build());
 
 }
@@ -9103,6 +9106,52 @@ FMonolithActionResult FMonolithAnimationActions::HandleCreateIKRig(const TShared
 	return FMonolithActionResult::Success(Root);
 }
 
+// Seed the default retarget-op stack and auto-map FK/IK chains so a freshly
+// created (NewObject'd) retargeter actually transfers motion.
+//
+// A NewObject'd UIKRetargeter has an EMPTY op stack. The editor's asset factory
+// (UIKRetargetFactory::FactoryCreateNew) seeds it via Controller->AddDefaultOps()
+// right after creation; a programmatically created one never gets that, so
+// UIKRetargetBatchOperation::RunRetarget transfers nothing and bakes a static
+// pose into full-length tracks (frozen output). This replicates the engine's own
+// seeding sequence (mirrors FProceduralRetargetAssets::AutoGenerateIKRetargetAsset
+// in SRetargetAnimAssetsWindow.cpp): rigs are assigned first, then default ops are
+// added, then chains are auto-mapped. AddDefaultOps is idempotent — ops already
+// present are not re-added — so this is safe to call on an existing retargeter too.
+//
+// Returns the number of ops on the stack after seeding (for reporting).
+static int32 SeedRetargeterDefaultOps(UIKRetargeterController* C, EAutoMapChainType AutoMapType)
+{
+	if (!C)
+	{
+		return 0;
+	}
+
+	// Add the default op set (Pelvis Motion, FK Chains, Run IK Rig, IK Chains,
+	// Root Motion, Curve Remap) if not already present, and run each op's initial
+	// setup so chain mappings are reinitialized against the assigned rigs.
+	C->AddDefaultOps();
+
+	// Auto-map the source->target retarget chains on every op that has a chain
+	// mapping (FK/IK chains ops). Without a chain mapping there is nothing for
+	// RunRetarget to transfer. bForceRemap=true so a re-seed re-maps cleanly.
+	C->AutoMapChains(AutoMapType, /*bForceRemap=*/true, /*InOpName=*/NAME_None);
+
+	return C->GetNumRetargetOps();
+}
+
+// Parse the optional "auto_map" param ("fuzzy" | "exact"); defaults to Fuzzy,
+// matching the engine's default-op behavior for humanoid retargets.
+static EAutoMapChainType ParseAutoMapType(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AutoMapStr;
+	if (Params->TryGetStringField(TEXT("auto_map"), AutoMapStr) && AutoMapStr.Equals(TEXT("exact"), ESearchCase::IgnoreCase))
+	{
+		return EAutoMapChainType::Exact;
+	}
+	return EAutoMapChainType::Fuzzy;
+}
+
 FMonolithActionResult FMonolithAnimationActions::HandleCreateIKRetargeter(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
@@ -9146,6 +9195,17 @@ FMonolithActionResult FMonolithAnimationActions::HandleCreateIKRetargeter(const 
 		bTargetSet = true;
 	}
 
+	// If both rigs were assigned at creation, seed the default op stack + auto-map
+	// chains so the retargeter is immediately usable by batch_retarget_animations.
+	// Without this, a NewObject'd retargeter has an empty op stack and produces
+	// frozen (static-pose) output. If only one/zero rigs given here, seeding is
+	// deferred to set_retargeter_rigs (which has both rigs by definition).
+	int32 OpCount = 0;
+	if (bSourceSet && bTargetSet)
+	{
+		OpCount = SeedRetargeterDefaultOps(C, ParseAutoMapType(Params));
+	}
+
 	FAssetRegistryModule::AssetCreated(Retargeter);
 	Pkg->MarkPackageDirty();
 
@@ -9154,6 +9214,8 @@ FMonolithActionResult FMonolithAnimationActions::HandleCreateIKRetargeter(const 
 	Root->SetStringField(TEXT("asset_name"), AssetName);
 	Root->SetBoolField(TEXT("source_rig_set"), bSourceSet);
 	Root->SetBoolField(TEXT("target_rig_set"), bTargetSet);
+	Root->SetNumberField(TEXT("retarget_op_count"), OpCount);
+	Root->SetBoolField(TEXT("default_ops_seeded"), OpCount > 0);
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -9179,6 +9241,12 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetRetargeterRigs(const T
 
 	C->SetIKRig(ERetargetSourceOrTarget::Source, SourceRig);
 	C->SetIKRig(ERetargetSourceOrTarget::Target, TargetRig);
+
+	// Seed the default op stack + auto-map chains now that BOTH rigs are assigned.
+	// SetIKRig only reinitializes chain mappings on ops that ALREADY exist, so on a
+	// freshly created retargeter (empty op stack) the rigs alone produce no motion.
+	// AddDefaultOps is idempotent, so re-running set_retargeter_rigs is harmless.
+	const int32 OpCount = SeedRetargeterDefaultOps(C, ParseAutoMapType(Params));
 
 	// Optional preview meshes.
 	bool bSourceMeshSet = false, bTargetMeshSet = false;
@@ -9215,6 +9283,8 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetRetargeterRigs(const T
 	Root->SetStringField(TEXT("target_rig"), TargetRig->GetPathName());
 	Root->SetBoolField(TEXT("source_preview_mesh_set"), bSourceMeshSet);
 	Root->SetBoolField(TEXT("target_preview_mesh_set"), bTargetMeshSet);
+	Root->SetNumberField(TEXT("retarget_op_count"), OpCount);
+	Root->SetBoolField(TEXT("default_ops_seeded"), OpCount > 0);
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -9228,6 +9298,22 @@ FMonolithActionResult FMonolithAnimationActions::HandleBatchRetargetAnimations(c
 
 	UIKRetargeterController* C = UIKRetargeterController::GetController(Retargeter);
 	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get UIKRetargeterController"));
+
+	// Self-heal: a retargeter created before the default-op seeding fix (or via raw
+	// NewObject) has an EMPTY op stack and would bake frozen output. If the asset
+	// has both IK rigs assigned but no ops, seed the default op stack + auto-map
+	// chains here so RunRetarget actually transfers motion. No-op when ops already
+	// exist (AddDefaultOps is idempotent), so configured retargeters are untouched.
+	bool bOpsSeededOnRun = false;
+	if (C->GetNumRetargetOps() == 0 &&
+		C->GetIKRig(ERetargetSourceOrTarget::Source) != nullptr &&
+		C->GetIKRig(ERetargetSourceOrTarget::Target) != nullptr)
+	{
+		Retargeter->Modify();
+		SeedRetargeterDefaultOps(C, ParseAutoMapType(Params));
+		Retargeter->MarkPackageDirty();
+		bOpsSeededOnRun = true;
+	}
 
 	// Resolve source/target meshes — explicit param wins, else fall back to the
 	// retargeter's configured preview meshes.
@@ -9347,6 +9433,8 @@ FMonolithActionResult FMonolithAnimationActions::HandleBatchRetargetAnimations(c
 	Root->SetStringField(TEXT("target_mesh"), TargetMesh->GetPathName());
 	Root->SetNumberField(TEXT("requested_count"), AssetsToRetarget.Num());
 	Root->SetNumberField(TEXT("created_count"), CreatedPaths.Num());
+	Root->SetBoolField(TEXT("ops_seeded_on_run"), bOpsSeededOnRun);
+	Root->SetNumberField(TEXT("retarget_op_count"), C->GetNumRetargetOps());
 
 	TArray<TSharedPtr<FJsonValue>> CreatedArr;
 	for (const FString& P : CreatedPaths) CreatedArr.Add(MakeShared<FJsonValueString>(P));
