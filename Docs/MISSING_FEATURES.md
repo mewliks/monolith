@@ -6,6 +6,23 @@
 
 ---
 
+## 2026-06-07 — RESOLVED: Motion Matching authoring pack + PIE/profiling harness (0.18.1)
+
+Field gaps surfaced building an end-to-end Motion Matching setup + autonomous AI locomotion workflow, now addressed (see `SPEC_CORE.md` §12 2026-06-07 notes, `specs/SPEC_MonolithAnimation.md`, `specs/SPEC_MonolithBlueprint.md`, `specs/SPEC_MonolithAI.md`, `specs/SPEC_MonolithEditor.md`):
+
+- **Motion Matching authoring.** Pose Search schema/database primitives, mirror data tables, chooser-table authoring (`create_chooser_table` / `add_chooser_column` w/ `enum_class` / `add_chooser_row` / `set_chooser_cell`), AnimBP graph (`build_motion_matching_node` etc.), and `build_foot_ik_pass`.
+- **Thread-safe AnimBP authoring.** `add_property_access_node`, `set_function_thread_safe`, `bind_chooser_database_via_threadsafe`; `scaffold_locomotion_anim_values` now emits a fully-wired thread-safe body and can target a named function graph.
+- **Character/actor scaffolding.** `scaffold_motion_matching_character` + the `blueprint` MM scaffolders; inherited native-component CDO-override persistence.
+- **Retarget create/run.** `create_ik_rig` / `create_ik_retargeter` / `set_retargeter_rigs` / `batch_retarget_animations` (auto-seeds the retarget op stack so clips are no longer frozen).
+- **AI autonomy.** `AMonolithBehaviorTreeAIController` (runs a BT on `OnPossess`) + movement-driving BT task classes; `reorder_bt_children` persistence + Blackboard linking fixes.
+- **PIE / profiling harness.** Async PIE-smoke sessions, CSV/Insights profiling brackets, clip + anim-frame capture, `actor_setup`, map authoring, nav rebuild/validate.
+
+**OPEN follow-up:**
+- **`build_foot_ik_pass` ground-trace effector drive.** Foot IK is wired and pose-driving (non-Ignore `ModifyBone` mode + Two-Bone IK effector space/bone set), but the effector is NOT yet driven from a ground trace — full ground-contact adaptation is a follow-up. Document honestly; do not claim ground-adaptive foot IK until the trace drive lands.
+- **State-machine float/expression transition rules.** `build_state_machine` supports bool-var + automatic rules; float and expression-graph rules are still deferred.
+
+---
+
 ## 2026-06-06 — RESOLVED: field-surfaced shortcomings pass (Wave 16)
 
 Field gaps surfaced building an AnimBP / state-machine authoring + test/profiling harness workflow, now addressed (5 new actions + behaviors; see `SPEC_CORE.md` §12 2026-06-06 note, `specs/SPEC_MonolithEditor.md`, `specs/SPEC_MonolithAnimation.md`):
@@ -20,9 +37,9 @@ Field gaps surfaced building an AnimBP / state-machine authoring + test/profilin
 
 ---
 
-## 2026-05-23 — AnimBP / Blueprint (Leviathan PFP first-person framework work)
+## 2026-05-23 — AnimBP / Blueprint (first-person framework work)
 
-Surfaced finishing the PFP weapon framework in `ABP_SandboxCharacter_CMC_LayeringWrapper`. Each gap blocked an action or forced a manual Details-panel workaround. Source refs are UE 5.7 engine paths.
+Surfaced finishing a first-person weapon framework AnimBP. Each gap blocked an action or forced a manual Details-panel workaround. Source refs are UE 5.7 engine paths.
 
 1. **Set/read an AnimBP function `Thread Safe` flag.** No MCP path to SET `bThreadSafe` (`BlueprintThreadSafe` meta) on a user function, and `get_functions` doesn't surface it for READ either — so a thread-safe AnimBP getter can't be authored end-to-end via MCP.
    - **Add:** `blueprint::set_function_thread_safe(asset, function, bool)` (mirror `OnIsThreadSafeFunctionModified`) + expose `thread_safe` in `get_functions` output.
