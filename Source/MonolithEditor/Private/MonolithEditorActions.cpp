@@ -5314,6 +5314,49 @@ namespace MonolithEditorPieSmoke
 			Root->SetArrayField(TEXT("probes"), ProbeArr);
 		}
 
+		// Gap 9: time-series sampling + typed-provocation report. Emitted for a timeseries
+		// session (bTimeseries). The full per-sample {t, vars:{...}} array is gated behind
+		// bFull (completion or include_samples) like the smoke samples; the provocation fire
+		// log is always emitted so a caller sees what fired without pulling the whole series.
+		if (S.bTimeseries)
+		{
+			Root->SetNumberField(TEXT("timeseries_sample_count"), S.TimeseriesSamples.Num());
+
+			// Provocation fire log (always emitted).
+			TArray<TSharedPtr<FJsonValue>> ProvArr;
+			for (const FPieProvocation& Prov : S.Provocations)
+			{
+				TSharedPtr<FJsonObject> PObj = MakeShared<FJsonObject>();
+				PObj->SetStringField(TEXT("action"), Prov.RawAction);
+				PObj->SetNumberField(TEXT("time"), Prov.AtSeconds);
+				PObj->SetBoolField(TEXT("fired"), Prov.bFired);
+				PObj->SetNumberField(TEXT("fired_at_seconds"), Prov.FiredAtSeconds);
+				PObj->SetBoolField(TEXT("dispatched"), Prov.bDispatched);
+				if (!Prov.Result.IsEmpty()) { PObj->SetStringField(TEXT("result"), Prov.Result); }
+				ProvArr.Add(MakeShared<FJsonValueObject>(PObj));
+			}
+			Root->SetArrayField(TEXT("provocations"), ProvArr);
+
+			// Full per-sample time-series (gated by bFull).
+			if (bFull)
+			{
+				TArray<TSharedPtr<FJsonValue>> SeriesArr;
+				for (const FPieTimeseriesSample& TS : S.TimeseriesSamples)
+				{
+					TSharedPtr<FJsonObject> SObj = MakeShared<FJsonObject>();
+					SObj->SetNumberField(TEXT("t"), TS.TimeSeconds);
+					TSharedPtr<FJsonObject> VarsObj = MakeShared<FJsonObject>();
+					for (const TPair<FString, TSharedPtr<FJsonValue>>& Var : TS.Vars)
+					{
+						if (Var.Value.IsValid()) { VarsObj->SetField(Var.Key, Var.Value); }
+					}
+					SObj->SetObjectField(TEXT("vars"), VarsObj);
+					SeriesArr.Add(MakeShared<FJsonValueObject>(SObj));
+				}
+				Root->SetArrayField(TEXT("timeseries"), SeriesArr);
+			}
+		}
+
 		// Phase 8 (OG-E2/E5): structured actor_setup outcome. Per-entry class/DataAsset
 		// resolution + per-actor spawn ok/fail, applied/unmatched DataAsset fields, and the
 		// AI move-request result — so callers distinguish partial from full apply
@@ -5518,6 +5561,211 @@ FMonolithActionResult FMonolithEditorActions::HandleRunPieSmoke(const TSharedPtr
 	Result->SetBoolField(TEXT("started"), true);
 	Result->SetStringField(TEXT("marker"), Marker);
 	Result->SetNumberField(TEXT("duration"), Duration);
+	return FMonolithActionResult::Success(Result);
+}
+
+// ---------------------------------------------------------------------------
+// Gap 9: sample_pie_timeseries — async time-series PIE sampling + typed provocation.
+// Same async lifecycle as run_pie_smoke (returns {session_id, status:'running'}; polled
+// via poll_pie_smoke, stopped via stop_pie_smoke). Reuses the in-TU PIE-start / map-load /
+// compile-gate helpers + the shared FPieSmokeSessionManager — no parallel ticker.
+// ---------------------------------------------------------------------------
+
+namespace MonolithEditorPieSmoke
+{
+	// Parse a [x,y,z] JSON array into a vector (missing components default to 0).
+	static FVector ParseVec3(const TArray<TSharedPtr<FJsonValue>>& Arr, const FVector& Fallback)
+	{
+		FVector V = Fallback;
+		if (Arr.Num() >= 1 && Arr[0].IsValid()) { V.X = Arr[0]->AsNumber(); }
+		if (Arr.Num() >= 2 && Arr[1].IsValid()) { V.Y = Arr[1]->AsNumber(); }
+		if (Arr.Num() >= 3 && Arr[2].IsValid()) { V.Z = Arr[2]->AsNumber(); }
+		return V;
+	}
+
+	// Resolve typed provocations from the params 'provocations' array. Each entry is
+	// {time, action, params}. Unknown actions are dropped (with the raw token preserved
+	// so the report can flag them). Params interpretation is per-action.
+	static TArray<FPieProvocation> ResolveProvocations(const TSharedPtr<FJsonObject>& Params)
+	{
+		TArray<FPieProvocation> Out;
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (!Params.IsValid() || !Params->TryGetArrayField(TEXT("provocations"), Arr) || !Arr)
+		{
+			return Out;
+		}
+		for (const TSharedPtr<FJsonValue>& Entry : *Arr)
+		{
+			const TSharedPtr<FJsonObject>* Obj = nullptr;
+			if (!Entry.IsValid() || !Entry->TryGetObject(Obj) || !Obj || !(*Obj).IsValid()) { continue; }
+
+			FPieProvocation Prov;
+			(*Obj)->TryGetNumberField(TEXT("time"), Prov.AtSeconds);
+			(*Obj)->TryGetStringField(TEXT("action"), Prov.RawAction);
+
+			const TSharedPtr<FJsonObject>* PParams = nullptr;
+			const bool bHasParams = (*Obj)->TryGetObjectField(TEXT("params"), PParams) && PParams && (*PParams).IsValid();
+
+			if (Prov.RawAction.Equals(TEXT("set_control_rotation"), ESearchCase::IgnoreCase))
+			{
+				Prov.Action = EPieProvocationAction::SetControlRotation;
+				if (bHasParams)
+				{
+					double Pitch = 0.0, Yaw = 0.0, Roll = 0.0;
+					(*PParams)->TryGetNumberField(TEXT("pitch"), Pitch);
+					(*PParams)->TryGetNumberField(TEXT("yaw"), Yaw);
+					(*PParams)->TryGetNumberField(TEXT("roll"), Roll);
+					Prov.Rotation = FRotator(Pitch, Yaw, Roll);
+				}
+			}
+			else if (Prov.RawAction.Equals(TEXT("add_movement_input"), ESearchCase::IgnoreCase))
+			{
+				Prov.Action = EPieProvocationAction::AddMovementInput;
+				if (bHasParams)
+				{
+					const TArray<TSharedPtr<FJsonValue>>* DirArr = nullptr;
+					if ((*PParams)->TryGetArrayField(TEXT("direction"), DirArr) && DirArr)
+					{
+						Prov.Direction = ParseVec3(*DirArr, FVector::ForwardVector);
+					}
+					(*PParams)->TryGetNumberField(TEXT("scale"), Prov.Scale);
+				}
+			}
+			else if (Prov.RawAction.Equals(TEXT("jump"), ESearchCase::IgnoreCase))
+			{
+				Prov.Action = EPieProvocationAction::Jump;
+			}
+			else if (Prov.RawAction.Equals(TEXT("console_command"), ESearchCase::IgnoreCase))
+			{
+				Prov.Action = EPieProvocationAction::ConsoleCommand;
+				if (bHasParams)
+				{
+					(*PParams)->TryGetStringField(TEXT("command"), Prov.Command);
+				}
+			}
+			else
+			{
+				Prov.Action = EPieProvocationAction::Unknown;
+			}
+			Out.Add(MoveTemp(Prov));
+		}
+		return Out;
+	}
+}
+
+FMonolithActionResult FMonolithEditorActions::StartTimeseriesSession(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithEditorPieSmoke;
+
+	if (!GEditor || !GUnrealEd)
+	{
+		return FMonolithActionResult::Error(TEXT("sample_pie_timeseries requires editor context (GEditor/GUnrealEd)."));
+	}
+
+	// Target selector: one of actor / pawn_class / object_name (mirrors Gap 8's resolver
+	// vocabulary; 'actor' = exact label, 'pawn_class' = class-name substring).
+	FString TargetActorLabel, TargetObjectName, TargetClassName;
+	Params->TryGetStringField(TEXT("actor"), TargetActorLabel);
+	Params->TryGetStringField(TEXT("object_name"), TargetObjectName);
+	Params->TryGetStringField(TEXT("pawn_class"), TargetClassName);
+	if (TargetActorLabel.IsEmpty() && TargetObjectName.IsEmpty() && TargetClassName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("sample_pie_timeseries requires one of: actor, pawn_class, object_name"));
+	}
+
+	TArray<FString> VarPaths;
+	ReadStringArrayField(Params, TEXT("variables"), VarPaths);
+	if (VarPaths.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("sample_pie_timeseries requires a non-empty 'variables' array of dotted paths"));
+	}
+
+	double Duration = 6.0;
+	if (Params->HasField(TEXT("duration_seconds"))) { Duration = Params->GetNumberField(TEXT("duration_seconds")); }
+	Duration = FMath::Clamp(Duration, 0.0, 120.0);
+
+	double SampleInterval = 0.0;
+	if (Params->HasField(TEXT("sample_interval"))) { SampleInterval = Params->GetNumberField(TEXT("sample_interval")); }
+	SampleInterval = FMath::Max(0.0, SampleInterval);
+
+	int32 MaxSamples = 2048;
+	if (Params->HasField(TEXT("max_samples"))) { MaxSamples = (int32)Params->GetNumberField(TEXT("max_samples")); }
+	MaxSamples = FMath::Clamp(MaxSamples, 1, 100000);
+
+	if (FindActivePieWorld())
+	{
+		return FMonolithActionResult::Error(TEXT("A PIE session is already running — stop it before sample_pie_timeseries."));
+	}
+
+	// Optional map load before PIE.
+	FString LoadError;
+	if (!LoadMapIfRequested(Params, LoadError))
+	{
+		return FMonolithActionResult::Error(LoadError);
+	}
+
+	// Compile-error gate (same policy as run_pie_smoke: refuse a broken world by default).
+	FString CompileMode = TEXT("refuse");
+	Params->TryGetStringField(TEXT("on_compile_errors"), CompileMode);
+	const bool bSuppressModals = CompileMode.Equals(TEXT("suppress"), ESearchCase::IgnoreCase);
+	{
+		TArray<FErroredBlueprintEntry> Errored;
+		ScanErroredBlueprints(Errored);
+		if (Errored.Num() > 0 && !bSuppressModals)
+		{
+			TSharedPtr<FJsonObject> ErrObj = MakeShared<FJsonObject>();
+			ErrObj->SetNumberField(TEXT("errored_blueprint_count"), Errored.Num());
+			ErrObj->SetArrayField(TEXT("errored_blueprints"), ErroredBlueprintsToJson(Errored));
+			return FMonolithActionResult::Error(
+				FString::Printf(TEXT("sample_pie_timeseries refused: %d Blueprint(s) have unresolved compile errors. ")
+					TEXT("Fix them, or pass on_compile_errors=\"suppress\" to PIE anyway."), Errored.Num()))
+				.WithErrorData(ErrObj);
+		}
+	}
+
+	FString StartError;
+	if (!StartPieInternal(StartError, bSuppressModals))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to start PIE: %s"), *StartError));
+	}
+
+	UWorld* PieWorld = FindActivePieWorld();
+	const FString Marker = TEXT("MONOLITH_TIMESERIES");
+	UE_LOG(LogMonolith, Display, TEXT("%s begin (map=%s)"), *Marker,
+		PieWorld ? *PieWorld->GetMapName() : TEXT("<current>"));
+
+	// Optional start-time console/python scripts (best-effort), same as run_pie_smoke.
+	if (PieWorld)
+	{
+		RunScripts(Params, PieWorld);
+	}
+
+	// Build the time-series session.
+	FPieSmokeSession Session;
+	Session.StartTimeSeconds = FPlatformTime::Seconds();
+	Session.DurationSeconds = Duration;
+	Session.Marker = Marker;
+	Session.MapName = PieWorld ? PieWorld->GetMapName() : TEXT("<current>");
+
+	Session.bTimeseries = true;
+	Session.TimeseriesVarPaths = MoveTemp(VarPaths);
+	Session.SampleInterval = SampleInterval;
+	Session.MaxSamples = MaxSamples;
+	Session.TargetActorLabel = TargetActorLabel;
+	Session.TargetObjectName = TargetObjectName;
+	Session.TargetClassName = TargetClassName;
+	Params->TryGetStringField(TEXT("component_name"), Session.TargetComponentName);
+	Params->TryGetBoolField(TEXT("anim_instance"), Session.bTargetAnimInstance);
+	Session.Provocations = ResolveProvocations(Params);
+
+	const FString SessionId = FPieSmokeSessionManager::Get().CreateSession(MoveTemp(Session));
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("session_id"), SessionId);
+	Result->SetStringField(TEXT("status"), TEXT("running"));
+	Result->SetBoolField(TEXT("started"), true);
+	Result->SetNumberField(TEXT("duration"), Duration);
+	Result->SetStringField(TEXT("note"), TEXT("Poll with poll_pie_smoke; stop with stop_pie_smoke. Time-series under 'timeseries'; provocation fire log under 'provocations'."));
 	return FMonolithActionResult::Success(Result);
 }
 

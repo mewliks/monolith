@@ -18,8 +18,9 @@ class FProperty;
  * original single-segment behavior (back-compat). Array / map indexing is out of scope:
  * dotted traversal descends struct members only.
  *
- * Factored into its own header/cpp so other module-internal readers (PIE property
- * sampling) can share one resolver. Kept module-internal; not exported.
+ * Lives in MonolithCore (Public) so module-internal readers in either MonolithAnimation
+ * (anim-instance sampling) or MonolithEditor (PIE object property read + function-arg
+ * marshalling) share one resolver. Exported via MONOLITHCORE_API.
  */
 namespace MonolithStructField
 {
@@ -41,5 +42,5 @@ namespace MonolithStructField
 	 * @param Path       A member name, optionally dotted to descend nested structs.
 	 * @return The leaf FProperty + value pointer, or a miss with FailedSegment set.
 	 */
-	FResolved Resolve(const UObject* Container, const FString& Path);
+	MONOLITHCORE_API FResolved Resolve(const UObject* Container, const FString& Path);
 }

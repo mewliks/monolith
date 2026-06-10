@@ -123,6 +123,13 @@ public:
 	static FMonolithActionResult HandleStopPieSmoke(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCapturePieMovementClip(const TSharedPtr<FJsonObject>& Params);
 
+	// Gap 9: start a time-series PIE session (same async lifecycle as run_pie_smoke:
+	// returns {session_id, status:'running'}; polled via poll_pie_smoke, stopped via
+	// stop_pie_smoke). Lives here so it reuses the in-TU PIE-start + map-load + compile-gate
+	// helpers and the shared FPieSmokeSessionManager. Registered under the "animation"
+	// namespace from the editor module; the handler delegates here.
+	static FMonolithActionResult StartTimeseriesSession(const TSharedPtr<FJsonObject>& Params);
+
 	// Read-only scan of loaded UBlueprints for the engine's PIE compile-error
 	// condition (BS_Error && bDisplayCompilePIEWarning). Returns {count, blueprints:[{name, path}]}.
 	// Same scan run_pie_smoke's on_compile_errors=refuse gate uses to avoid starting

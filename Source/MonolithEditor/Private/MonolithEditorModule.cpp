@@ -1,6 +1,8 @@
 #include "MonolithEditorModule.h"
 #include "MonolithEditorActions.h"
 #include "MonolithEditorMapActions.h"
+#include "MonolithPieObjectActions.h"
+#include "MonolithPieTimeseries.h"
 #include "MonolithSettingsCustomization.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
@@ -59,6 +61,13 @@ void FMonolithEditorModule::StartupModule()
 
 	FMonolithEditorActions::RegisterActions(LogCapture);
 	FMonolithEditorMapActions::RegisterActions(FMonolithToolRegistry::Get());  // F8: create_empty_map + get_module_status
+	// Gap 8: live-PIE object property read + function call (editor namespace).
+	FMonolithPieObjectActions::RegisterActions(FMonolithToolRegistry::Get());
+	// Gap 9: time-series PIE sampling with scripted provocation. Implemented in
+	// MonolithEditor (it owns the async PIE-smoke session machinery) but registered
+	// under the "animation" namespace string — the registry is namespace-string-keyed,
+	// not module-keyed (see UnregisterNamespace note in ShutdownModule).
+	FMonolithPieTimeseries::RegisterActions(FMonolithToolRegistry::Get());
 
 	// Register settings detail customization
 	FPropertyEditorModule& PropModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
