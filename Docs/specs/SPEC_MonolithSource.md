@@ -10,13 +10,13 @@
 
 **Dependencies:** Core, CoreUObject, Engine, MonolithCore, SQLiteCore, EditorSubsystem, UnrealEd, Json, JsonUtilities, Slate, SlateCore
 
-**Note:** Module structure was flattened — the vestigial outer stub has been removed. MonolithSource registers ~16+ actions (plus `suggest_build_cs_deps`, registered onto `source` from MonolithReflectionIntel). The engine source indexer is a native C++ implementation (`UMonolithSourceSubsystem` builds `EngineSource.db` in-process). The legacy Python tree-sitter indexer (`Scripts/source_indexer/`) is no longer used.
+**Note:** Module structure was flattened — the vestigial outer stub has been removed. MonolithSource registers ~19+ actions (plus `suggest_build_cs_deps`, registered onto `source` from MonolithReflectionIntel). The engine source indexer is a native C++ implementation (`UMonolithSourceSubsystem` builds `EngineSource.db` in-process). The legacy Python tree-sitter indexer (`Scripts/source_indexer/`) is no longer used.
 
 ### Classes
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithSourceModule` | Registers ~16+ source actions |
+| `FMonolithSourceModule` | Registers ~19+ source actions |
 | `UMonolithSourceSubsystem` | UEditorSubsystem. Owns engine source DB. Runs native C++ source indexer. Exposes `TriggerReindex()` (full engine re-index) and `TriggerProjectReindex()` (project C++ only, incremental). **F17 (2026-04-26):** Auto-binds `FCoreUObjectDelegates::ReloadCompleteDelegate` at `Initialize` to kick incremental project reindex on Live Coding / hot-reload completion (5s cooldown + `bIsIndexing` re-entrancy guard + bootstrap-DB-missing skip). Unbinds at `Deinitialize`. |
 | `FMonolithSourceDatabase` | Read-only SQLite wrapper. Thread-safe via FCriticalSection. FTS queries with prefix matching |
 | `FMonolithSourceActions` | ~14+ handlers. Helpers: IsForwardDeclaration (regex), ExtractMembers (smart class outline), DeriveIncludePath (Phase 1) |
@@ -32,7 +32,7 @@
 
 After F17, agents do not need to invoke any source-reindex action manually in the common dev loop — just run UBT or Live Coding and `source_query` reflects the new symbols within ~1 second.
 
-### Actions (~18+ — namespace: "source")
+### Actions (~20 — namespace: "source")
 
 | Action | Params | Description |
 |--------|--------|-------------|
@@ -131,5 +131,7 @@ Two actions for header pre-flight + class scaffolding. Both are read-only / idem
   - **Template-parameter guard** — a multi-line template parameter list can place `class T` alone on a line ahead of the real class's `{`; if the nearest preceding non-empty clean line ends with `<` or `,`, the match is treated as a template parameter and skipped (the SUBSEQUENT real declaration still indexes).
 
 **Bootstrap requirement:** the parser change is indexer-side, no schema change. Existing `EngineSource.db` files enrich with the previously-missing plain-class rows and their members on the next full `source.trigger_reindex` (the project-only F17/`trigger_project_reindex` pass enriches project symbols only). No offline-tool change — `monolith_query.exe` / `monolith_offline.py` read the same DB and return the richer results automatically after reindex.
+
+**Measured enrichment (full reindex 2026-06-11):** `symbols` rows `301,590 → 967,491` — plain classes `1,584 → 40,454`, plain structs `2,754 → 36,832`, functions `77,451 → 411,303` (member extraction of the newly indexed classes). DB file size unchanged at ~7.0 GB (SQLite page reuse); full-reindex wall time ~28.5 min, comparable to prior full passes. The fix also hardened the member extractor against two latent crash classes it exposed (an unterminated-brace-at-EOF out-of-bounds read and a use-after-free when the symbol array reallocates mid-extraction — both previously reachable from Phase A as well).
 
 ---
