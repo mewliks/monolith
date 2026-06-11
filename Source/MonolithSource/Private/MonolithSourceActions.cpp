@@ -114,6 +114,30 @@ void FMonolithSourceActions::RegisterAll()
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleTriggerProjectReindex),
 		MakeShared<FJsonObject>());
 
+	// --- Phase 1: LLM C++ authoring ergonomics (items 1-3) ---
+
+	Registry.RegisterAction(TEXT("source"), TEXT("get_include_path"),
+		TEXT("Get the canonical #include path for a symbol (resolves via the owning class header). Public/Classes/Internal headers are includable cross-module; Private headers return includable:false with a same-module note."),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleGetIncludePath),
+		FParamSchemaBuilder()
+			.Required(TEXT("symbol"), TEXT("string"), TEXT("Symbol name (class, struct, or Class::Method)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("source"), TEXT("get_signature"),
+		TEXT("Get the declaration signature(s) for a symbol or Class::Method. Reads the declaration line(s) from source (engine class-body methods are not indexed as symbols); strips inline bodies and macro line-continuations. Overloads returned as separate entries."),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleGetSignature),
+		FParamSchemaBuilder()
+			.Required(TEXT("symbol"), TEXT("string"), TEXT("Symbol name or Class::Method"))
+			.Optional(TEXT("limit"), TEXT("integer"), TEXT("Max overloads to return"), TEXT("10"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("source"), TEXT("check_deprecations"),
+		TEXT("Batch-check whether symbols are UE_DEPRECATED. Returns per-symbol {deprecated, version, message, kind}. If the deprecation index is empty (schema v2 landed but no reindex yet), returns index_state:\"empty\" with a hint to run source.trigger_reindex."),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleCheckDeprecations),
+		FParamSchemaBuilder()
+			.Required(TEXT("symbols"), TEXT("array"), TEXT("Array of symbol names to check"))
+			.Build());
+
 	// Survivor A (plan §3.A) — annotate the `source_query` namespace dispatcher
 	// as read-only + idempotent. The `trigger_reindex` / `trigger_project_reindex`
 	// actions are conservatively non-destructive (they kick a background sweep
@@ -126,6 +150,11 @@ void FMonolithSourceActions::RegisterAll()
 	SourceAnnotations.bIdempotentHint = true;
 	SourceAnnotations.Title = TEXT("Source-index query");
 	Registry.SetDispatcherAnnotations(TEXT("source"), SourceAnnotations);
+
+	// Phase 1 actions are pure reads — mark each read-only + idempotent + non-destructive.
+	Registry.SetActionAnnotations(TEXT("source"), TEXT("get_include_path"),  /*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Get include path"));
+	Registry.SetActionAnnotations(TEXT("source"), TEXT("get_signature"),     /*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Get signature"));
+	Registry.SetActionAnnotations(TEXT("source"), TEXT("check_deprecations"),/*bReadOnly=*/true, /*bDestructive=*/false, /*bIdempotent=*/true, TEXT("Check deprecations"));
 }
 
 // ============================================================================
@@ -156,6 +185,104 @@ FString FMonolithSourceActions::ShortPath(const FString& FullPath)
 		return Relative;
 	}
 	return FullPath;
+}
+
+FString FMonolithSourceActions::DeriveIncludePath(const FString& IndexedFilePath, bool& bOutIncludable, FString& OutWarning)
+{
+	bOutIncludable = true;
+	OutWarning.Empty();
+
+	// Normalize to forward slashes for prefix scanning + canonical include form.
+	FString Path = IndexedFilePath;
+	Path.ReplaceInline(TEXT("\\"), TEXT("/"));
+
+	// Derive the owning module name from the .../Source/<Module>/ segment, used
+	// only for the Private-header warning text.
+	FString ModuleName;
+	{
+		int32 SrcIdx = Path.Find(TEXT("/Source/"), ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+		if (SrcIdx != INDEX_NONE)
+		{
+			FString AfterSrc = Path.Mid(SrcIdx + 8); // skip "/Source/"
+			int32 Slash = INDEX_NONE;
+			if (AfterSrc.FindChar(TEXT('/'), Slash))
+			{
+				ModuleName = AfterSrc.Left(Slash);
+			}
+		}
+	}
+
+	// Find a recognised header-root prefix and return the path relative to it.
+	// Order matters only in that each is checked independently; the LAST occurrence
+	// is used so nested module trees resolve to the innermost root.
+	static const TCHAR* IncludableRoots[] = { TEXT("/Public/"), TEXT("/Classes/"), TEXT("/Internal/") };
+	for (const TCHAR* Root : IncludableRoots)
+	{
+		int32 Idx = Path.Find(Root, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+		if (Idx != INDEX_NONE)
+		{
+			FString Rel = Path.Mid(Idx + FCString::Strlen(Root));
+			bOutIncludable = true;
+			return Rel;
+		}
+	}
+
+	// Private/ — NOT includable from another module. Return the same-module
+	// relative form (after Private/) and flag it.
+	{
+		int32 Idx = Path.Find(TEXT("/Private/"), ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+		if (Idx != INDEX_NONE)
+		{
+			FString Rel = Path.Mid(Idx + 9); // skip "/Private/"
+			bOutIncludable = false;
+			OutWarning = FString::Printf(
+				TEXT("Private header — not includable outside %s; same-module include shown"),
+				ModuleName.IsEmpty() ? TEXT("its module") : *ModuleName);
+			return Rel;
+		}
+	}
+
+	// No recognised prefix (e.g. engine headers outside the Public/Private layout)
+	// -> basename fallback.
+	bOutIncludable = true;
+	return FPaths::GetCleanFilename(Path);
+}
+
+bool FMonolithSourceActions::ResolveOwningModule(FMonolithSourceDatabase* DB, const FString& Symbol, FString& OutModule, FString& OutBuildCsNote)
+{
+	OutModule.Empty();
+	OutBuildCsNote.Empty();
+	if (!DB) return false;
+
+	// Resolve the symbol's owning file. For a Class::Method input the method
+	// itself need not be a symbol row — resolve via the owning class.
+	FString LookupName = Symbol;
+	int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	if (ScopeIdx != INDEX_NONE)
+	{
+		LookupName = Symbol.Left(ScopeIdx); // the class/struct
+	}
+
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(LookupName);
+	if (Symbols.Num() == 0) Symbols = DB->SearchSymbolsFTS(LookupName, 5);
+	if (Symbols.Num() == 0) return false;
+
+	FString BuildCsPath;
+	if (!DB->GetFileModuleInfo(Symbols[0].FileId, OutModule, BuildCsPath))
+	{
+		return false;
+	}
+
+	if (!BuildCsPath.IsEmpty())
+	{
+		OutBuildCsNote = FString::Printf(TEXT("Module '%s' — add to your Build.cs deps (%s)"),
+			*OutModule, *FPaths::GetCleanFilename(BuildCsPath));
+	}
+	else
+	{
+		OutBuildCsNote = FString::Printf(TEXT("Module '%s' — add to your Build.cs deps"), *OutModule);
+	}
+	return true;
 }
 
 FString FMonolithSourceActions::ReadFileLines(const FString& FilePath, int32 StartLine, int32 EndLine)
@@ -1284,6 +1411,374 @@ FMonolithActionResult FMonolithSourceActions::HandleTriggerProjectReindex(const 
 	auto ContentItem = MakeShared<FJsonObject>();
 	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
 	ContentItem->SetStringField(TEXT("text"), TEXT("Project source indexing started (incremental). This runs in the background — check editor log for progress."));
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Phase 1 — item 1: get_include_path
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleGetIncludePath(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+	}
+
+	const FString Symbol = Params->GetStringField(TEXT("symbol"));
+	if (Symbol.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("'symbol' is required."));
+	}
+
+	// For a Class::Method input resolve the include via the OWNING CLASS row — the
+	// method itself need not be a symbol; the file is the class's header regardless.
+	FString LookupName = Symbol;
+	int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	if (ScopeIdx != INDEX_NONE)
+	{
+		LookupName = Symbol.Left(ScopeIdx);
+	}
+
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(LookupName);
+	if (Symbols.Num() == 0) Symbols = DB->SearchSymbolsFTS(LookupName, 5);
+	if (Symbols.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No symbol found matching '%s'."), *Symbol));
+	}
+
+	// Prefer a header file when several rows share the name (e.g. decl + def).
+	const FMonolithSourceSymbol* Chosen = &Symbols[0];
+	for (const FMonolithSourceSymbol& S : Symbols)
+	{
+		const FString P = DB->GetFilePath(S.FileId);
+		if (P.EndsWith(TEXT(".h")))
+		{
+			Chosen = &S;
+			break;
+		}
+	}
+
+	const FString FilePath = DB->GetFilePath(Chosen->FileId);
+	bool bIncludable = true;
+	FString Warning;
+	const FString Include = DeriveIncludePath(FilePath, bIncludable, Warning);
+
+	FString ModuleName, BuildCsPath;
+	DB->GetFileModuleInfo(Chosen->FileId, ModuleName, BuildCsPath);
+	FString BuildCsNote;
+	if (!ModuleName.IsEmpty())
+	{
+		BuildCsNote = BuildCsPath.IsEmpty()
+			? FString::Printf(TEXT("Module '%s' — add to your Build.cs deps"), *ModuleName)
+			: FString::Printf(TEXT("Module '%s' — add to your Build.cs deps (%s)"), *ModuleName, *FPaths::GetCleanFilename(BuildCsPath));
+	}
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetStringField(TEXT("include"), Include);
+	ResultObj->SetBoolField(TEXT("includable"), bIncludable);
+	if (!ModuleName.IsEmpty()) ResultObj->SetStringField(TEXT("module"), ModuleName);
+	if (!BuildCsNote.IsEmpty()) ResultObj->SetStringField(TEXT("build_cs_note"), BuildCsNote);
+	if (!Warning.IsEmpty()) ResultObj->SetStringField(TEXT("warning"), Warning);
+
+	// Human-readable content envelope, matching the other source handlers.
+	FString Text = FString::Printf(TEXT("#include \"%s\""), *Include);
+	if (!ModuleName.IsEmpty()) Text += FString::Printf(TEXT("\nModule: %s"), *ModuleName);
+	if (!BuildCsNote.IsEmpty()) Text += FString::Printf(TEXT("\n%s"), *BuildCsNote);
+	if (!Warning.IsEmpty()) Text += FString::Printf(TEXT("\nWARNING: %s"), *Warning);
+
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), Text);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Phase 1 — item 2: get_signature
+//
+// Declaration-read is the PRIMARY mechanism (Step-0 finding): class-body method
+// declarations are NOT indexed as `symbols`, so we resolve via the owning class
+// row + source-line FTS over source_fts, read the declaration line(s) from the
+// file (continuation lines forward to the closing paren), and strip the trailing
+// macro `\` + any inline body. The `signature` column is an opportunistic fast
+// path ONLY when present AND body-free. Reports source: "declaration_read"|"column".
+// ============================================================================
+
+FString FMonolithSourceActions::CompactDeclaration(const TArray<FString>& Lines, int32 StartIdx)
+{
+	// Accumulate from StartIdx forward until we balance the parens that open the
+	// parameter list AND reach a `;` or `{`. Strip trailing `\` line continuations
+	// and any inline body.
+	FString Accum;
+	int32 ParenDepth = 0;
+	bool bSawOpenParen = false;
+
+	for (int32 i = StartIdx; i < Lines.Num() && i < StartIdx + 12; ++i)
+	{
+		FString Line = Lines[i];
+		// Strip a trailing macro line-continuation backslash.
+		Line.TrimEndInline();
+		if (Line.EndsWith(TEXT("\\")))
+		{
+			Line = Line.LeftChop(1).TrimEnd();
+		}
+
+		bool bDone = false;
+		for (int32 c = 0; c < Line.Len(); ++c)
+		{
+			const TCHAR Ch = Line[c];
+			if (Ch == TEXT('('))      { ParenDepth++; bSawOpenParen = true; }
+			else if (Ch == TEXT(')')) { ParenDepth = FMath::Max(0, ParenDepth - 1); }
+			else if (ParenDepth == 0 && bSawOpenParen && (Ch == TEXT('{') || Ch == TEXT(';')))
+			{
+				// End of declaration — everything before this terminator was already
+				// appended char-by-char above; just stop (do NOT re-append the prefix
+				// — that double-counted the line and duplicated the tail).
+				bDone = true;
+				break;
+			}
+			Accum += Ch;
+		}
+
+		if (bDone) break;
+		Accum += TEXT(" ");
+	}
+
+	// Collapse runs of whitespace for a clean one-line signature.
+	FString Out;
+	bool bPrevSpace = false;
+	for (const TCHAR Ch : Accum)
+	{
+		if (FChar::IsWhitespace(Ch))
+		{
+			if (!bPrevSpace) Out += TEXT(' ');
+			bPrevSpace = true;
+		}
+		else
+		{
+			Out += Ch;
+			bPrevSpace = false;
+		}
+	}
+	return Out.TrimStartAndEnd();
+}
+
+FMonolithActionResult FMonolithSourceActions::HandleGetSignature(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+	}
+
+	const FString Symbol = Params->GetStringField(TEXT("symbol"));
+	if (Symbol.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("'symbol' is required."));
+	}
+	const int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 10;
+
+	// The method name for FTS / column matching is the trailing identifier.
+	FString MethodName = Symbol;
+	int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	if (ScopeIdx != INDEX_NONE)
+	{
+		MethodName = Symbol.Mid(ScopeIdx + 2);
+	}
+
+	struct FOverload { FString Signature; FString Source; FString File; int32 Line = 0; };
+	TArray<FOverload> Overloads;
+
+	// --- Fast path: a body-free `signature` column on an indexed symbol row. ---
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(MethodName, TEXT("function"));
+	for (const FMonolithSourceSymbol& S : Symbols)
+	{
+		if (Overloads.Num() >= Limit) break;
+		if (S.Signature.IsEmpty()) continue;
+		// Body-free only — reject anything carrying an inline body or continuation.
+		if (S.Signature.Contains(TEXT("{")) || S.Signature.Contains(TEXT("\\"))) continue;
+		FOverload O;
+		O.Signature = S.Signature.TrimStartAndEnd();
+		O.Source = TEXT("column");
+		O.File = ShortPath(DB->GetFilePath(S.FileId));
+		O.Line = S.LineStart;
+		Overloads.Add(MoveTemp(O));
+	}
+
+	// --- Primary: declaration-read via source-line FTS over source_fts. ---
+	if (Overloads.Num() == 0)
+	{
+		// Search for the call/decl token. EscapeFTS strips the trailing '(' and the
+		// `::`, so we query the method name and verify the `Name(` shape per hit.
+		const FString FtsQuery = Symbol; // FTS escape handles :: -> space
+		TArray<FMonolithSourceChunk> Chunks = DB->SearchSourceFTS(FtsQuery, TEXT("all"), 50);
+
+		TSet<FString> SeenSignatures;
+		for (const FMonolithSourceChunk& Chunk : Chunks)
+		{
+			if (Overloads.Num() >= Limit) break;
+
+			const FString FilePath = DB->GetFilePath(Chunk.FileId);
+			TArray<FString> FileLines;
+			if (!FFileHelper::LoadFileToStringArray(FileLines, *FilePath)) continue;
+
+			// The chunk's line_number is the 1-based first line of a 10-line batch.
+			// Scan the batch window for a declaration line containing `MethodName(`.
+			const int32 WinStart = FMath::Max(0, Chunk.LineNumber - 1);
+			const int32 WinEnd = FMath::Min(FileLines.Num(), WinStart + 10);
+			const FString NeedlePattern = MethodName + TEXT("(");
+
+			for (int32 i = WinStart; i < WinEnd; ++i)
+			{
+				if (Overloads.Num() >= Limit) break;
+
+				const FString& L = FileLines[i];
+				int32 DeclIdx = L.Find(NeedlePattern, ESearchCase::CaseSensitive);
+				if (DeclIdx == INDEX_NONE) continue;
+				// Require the char before the name to be a non-identifier (so we don't
+				// match a substring of a longer identifier).
+				if (DeclIdx > 0)
+				{
+					const TCHAR Prev = L[DeclIdx - 1];
+					if (FChar::IsAlnum(Prev) || Prev == TEXT('_')) continue;
+				}
+
+				const FString Sig = CompactDeclaration(FileLines, i);
+				if (Sig.IsEmpty()) continue;
+				// Must look like a declaration: contains the method name and a paren.
+				if (!Sig.Contains(NeedlePattern)) continue;
+				if (SeenSignatures.Contains(Sig)) continue;
+				SeenSignatures.Add(Sig);
+
+				FOverload O;
+				O.Signature = Sig;
+				O.Source = TEXT("declaration_read");
+				O.File = ShortPath(FilePath);
+				O.Line = i + 1;
+				Overloads.Add(MoveTemp(O));
+			}
+		}
+	}
+
+	if (Overloads.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No signature found for '%s'."), *Symbol));
+	}
+
+	// Structured + text envelope.
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> OverloadArr;
+	TArray<FString> TextLines;
+	for (const FOverload& O : Overloads)
+	{
+		auto Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("signature"), O.Signature);
+		Obj->SetStringField(TEXT("source"), O.Source);
+		Obj->SetStringField(TEXT("file"), O.File);
+		Obj->SetNumberField(TEXT("line"), O.Line);
+		OverloadArr.Add(MakeShared<FJsonValueObject>(Obj));
+		TextLines.Add(FString::Printf(TEXT("%s\n  // %s @ %s:%d"), *O.Signature, *O.Source, *O.File, O.Line));
+	}
+	ResultObj->SetArrayField(TEXT("overloads"), OverloadArr);
+
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), FString::Join(TextLines, TEXT("\n")));
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Phase 1 — item 3: check_deprecations
+//
+// Batch read of symbol_deprecations. Empty-table (schema v2 landed, no reindex
+// yet) -> { index_state: "empty", hint: "run source.trigger_reindex" } and OMIT
+// per-symbol verdicts (Decision 3) — never a false "no symbol is deprecated".
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleCheckDeprecations(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+	}
+
+	// Collect the requested symbol names (array of strings).
+	TArray<FString> SymbolNames;
+	const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+	if (Params->TryGetArrayField(TEXT("symbols"), Arr) && Arr)
+	{
+		for (const TSharedPtr<FJsonValue>& V : *Arr)
+		{
+			FString S;
+			if (V.IsValid() && V->TryGetString(S) && !S.IsEmpty())
+			{
+				SymbolNames.Add(S);
+			}
+		}
+	}
+	if (SymbolNames.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("'symbols' must be a non-empty array of symbol names."));
+	}
+
+	auto ResultObj = MakeShared<FJsonObject>();
+
+	// Decision 3: empty deprecation index -> clean "empty" state, no verdicts.
+	if (DB->GetDeprecationCount() == 0)
+	{
+		ResultObj->SetStringField(TEXT("index_state"), TEXT("empty"));
+		ResultObj->SetStringField(TEXT("hint"), TEXT("run source.trigger_reindex"));
+
+		TArray<TSharedPtr<FJsonValue>> ContentArr;
+		auto ContentItem = MakeShared<FJsonObject>();
+		ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+		ContentItem->SetStringField(TEXT("text"),
+			TEXT("Deprecation index is empty (schema v2 landed but not yet populated). Run source.trigger_reindex to populate it."));
+		ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+		ResultObj->SetArrayField(TEXT("content"), ContentArr);
+		return FMonolithActionResult::Success(ResultObj);
+	}
+
+	TMap<FString, FMonolithDeprecationRow> Deprecated = DB->GetDeprecationsBatch(SymbolNames);
+
+	TArray<TSharedPtr<FJsonValue>> Verdicts;
+	TArray<FString> TextLines;
+	for (const FString& Name : SymbolNames)
+	{
+		auto Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("symbol"), Name);
+		const FMonolithDeprecationRow* Found = Deprecated.Find(Name);
+		if (Found)
+		{
+			Obj->SetBoolField(TEXT("deprecated"), true);
+			Obj->SetStringField(TEXT("version"), Found->Version);
+			Obj->SetStringField(TEXT("message"), Found->Message);
+			Obj->SetStringField(TEXT("kind"), Found->Kind);
+			TextLines.Add(FString::Printf(TEXT("%s: DEPRECATED (%s) [%s] %s"), *Name, *Found->Version, *Found->Kind, *Found->Message));
+		}
+		else
+		{
+			Obj->SetBoolField(TEXT("deprecated"), false);
+			TextLines.Add(FString::Printf(TEXT("%s: not deprecated"), *Name));
+		}
+		Verdicts.Add(MakeShared<FJsonValueObject>(Obj));
+	}
+	ResultObj->SetArrayField(TEXT("results"), Verdicts);
+
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), FString::Join(TextLines, TEXT("\n")));
 	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
 	ResultObj->SetArrayField(TEXT("content"), ContentArr);
 	return FMonolithActionResult::Success(ResultObj);

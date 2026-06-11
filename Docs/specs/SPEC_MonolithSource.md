@@ -10,16 +10,16 @@
 
 **Dependencies:** Core, CoreUObject, Engine, MonolithCore, SQLiteCore, EditorSubsystem, UnrealEd, Json, JsonUtilities, Slate, SlateCore
 
-**Note:** Module structure was flattened — the vestigial outer stub has been removed. MonolithSource registers 11 actions. The engine source indexer is a native C++ implementation (`UMonolithSourceSubsystem` builds `EngineSource.db` in-process). The legacy Python tree-sitter indexer (`Scripts/source_indexer/`) is no longer used.
+**Note:** Module structure was flattened — the vestigial outer stub has been removed. MonolithSource registers ~14+ actions. The engine source indexer is a native C++ implementation (`UMonolithSourceSubsystem` builds `EngineSource.db` in-process). The legacy Python tree-sitter indexer (`Scripts/source_indexer/`) is no longer used.
 
 ### Classes
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithSourceModule` | Registers 11 source actions |
+| `FMonolithSourceModule` | Registers ~14+ source actions |
 | `UMonolithSourceSubsystem` | UEditorSubsystem. Owns engine source DB. Runs native C++ source indexer. Exposes `TriggerReindex()` (full engine re-index) and `TriggerProjectReindex()` (project C++ only, incremental). **F17 (2026-04-26):** Auto-binds `FCoreUObjectDelegates::ReloadCompleteDelegate` at `Initialize` to kick incremental project reindex on Live Coding / hot-reload completion (5s cooldown + `bIsIndexing` re-entrancy guard + bootstrap-DB-missing skip). Unbinds at `Deinitialize`. |
 | `FMonolithSourceDatabase` | Read-only SQLite wrapper. Thread-safe via FCriticalSection. FTS queries with prefix matching |
-| `FMonolithSourceActions` | 11 handlers. Helpers: IsForwardDeclaration (regex), ExtractMembers (smart class outline) |
+| `FMonolithSourceActions` | ~14+ handlers. Helpers: IsForwardDeclaration (regex), ExtractMembers (smart class outline), DeriveIncludePath (Phase 1) |
 | ~~`UMonolithQueryCommandlet`~~ | **Removed.** Replaced by standalone `monolith_query.exe` (see Section 5.1). The exe has no UE runtime dependency and starts instantly |
 
 ### Auto-Reindex on Hot-Reload (F17)
@@ -32,7 +32,7 @@
 
 After F17, agents do not need to invoke any source-reindex action manually in the common dev loop — just run UBT or Live Coding and `source_query` reflects the new symbols within ~1 second.
 
-### Actions (11 — namespace: "source")
+### Actions (~14+ — namespace: "source")
 
 | Action | Params | Description |
 |--------|--------|-------------|
@@ -47,7 +47,44 @@ After F17, agents do not need to invoke any source-reindex action manually in th
 | `read_file` | `file_path`, `start_line`, `end_line` | Read source lines by path (absolute -> DB exact -> DB suffix match) |
 | `trigger_reindex` | none | Trigger full C++ engine source re-index (replaces entire EngineSource.db) |
 | `trigger_project_reindex` | none | Trigger incremental project-only C++ source re-index (updates project symbols in EngineSource.db without a full rebuild) |
+| `get_include_path` | `symbol` | Canonical `#include` form for a symbol, derived from its indexed file path (Phase 1). See contract below. |
+| `get_signature` | `symbol` | Exact overload signature(s) for a function/method. Declaration-read primary (Phase 1). See contract below. |
+| `check_deprecations` | `symbols[]` | Batch deprecation status for a symbol list, read from the `symbol_deprecations` index (Phase 1). See contract below. |
 
 **DB Location:** `Plugins/Monolith/Saved/EngineSource.db`
+
+### Phase 1 Action Contracts (LLM C++ Ergonomics)
+
+Three demand-proven lookups added so an agent can resolve an include, a signature, or a deprecation status in a single round-trip without reading raw source. All three are read-only / idempotent and offline-served by `monolith_query.exe` / `monolith_offline.py`.
+
+**`get_include_path`** — `DeriveIncludePath` derives the canonical include from the symbol's indexed file path, keyed on the prefix after the module `Source/<Module>/` root:
+
+- `Public/`, `Classes/`, `Internal/` → strip the prefix, return the includable cross-module form (`includable: true`).
+- `Private/` → NOT includable from another module: `includable: false` + a `warning` ("Private header — not includable outside `<Module>`; same-module include shown") and the same-module relative form is returned (not presented as a canonical cross-module include).
+- No recognised prefix (engine headers) → basename fallback.
+- Always forward-slashed. Emits the owning module + a `build_cs_note` (read from the backfilled `modules.build_cs_path`).
+- For a `Class::Method` input, the include resolves via the OWNING CLASS row — the method itself need not be a symbol, the file is the class's header regardless.
+
+**`get_signature`** — declaration-read is the PRIMARY mechanism. The handler resolves the symbol via the owning class row + source-line FTS over `source_fts` (the same FTS fallback `read_source` uses), reads the declaration line(s) from the file (forward to the closing paren), and strips any trailing macro `\` and inline body. The indexed `symbols.signature` column is used as an opportunistic fast path ONLY when present AND body-free. The response reports which source was used in a `source` field: `"declaration_read"` | `"column"`. Overloads are returned as separate entries.
+  - Rationale: `symbols.signature` is populated only for inline-defined functions and captures the body + macro continuations; class-body method declarations (`UGameplayStatics::ApplyDamage`, `UWorld::SpawnActor`, …) are not indexed as symbols at all, so column-only resolution would miss the bulk of the engine API.
+
+**`check_deprecations`** — accepts `symbols[]`, batch-reads `symbol_deprecations`, returns per-symbol `{deprecated, version, message, kind}`. When the table has zero rows (schema v2 landed but no reindex yet) it returns `{ index_state: "empty", hint: "run source.trigger_reindex" }` and OMITS per-symbol verdicts — never a false "no symbol is deprecated" clean bill.
+
+### Deprecation Index (schema v2)
+
+`check_deprecations` reads a `symbol_deprecations` table added to `EngineSource.db` in schema v2 (`SchemaVersion` 1→2). Populated by the indexer during the normal index pass: it regex-scans for `UE_DEPRECATED` / `UE_DEPRECATED_FORENGINE` / `UE_DEPRECATED_FORGAME` (and the `DeprecatedFunction` UFUNCTION specifier), parses the symbol NAME from the declaration text following the macro, and inserts a row.
+
+| Column | Note |
+|--------|------|
+| `id` | INTEGER PK AUTOINCREMENT |
+| `symbol_id` | **NULLABLE** — class-body methods have no `symbols` row; stored NULL when the name does not resolve. Lookups key on `symbol_name`, not this column. |
+| `symbol_name` | NOT NULL — parsed identifier before `(` in the declaration |
+| `version` | e.g. `"5.4"` — may be empty |
+| `message` | the deprecation message string |
+| `kind` | `UE_DEPRECATED` \| `UE_DEPRECATED_FORENGINE` \| `UE_DEPRECATED_FORGAME` \| `DeprecatedFunction` |
+
+**Bootstrap requirement:** the table is created via `CREATE TABLE IF NOT EXISTS`, so it appears empty on the next index pass after schema v2 lands. **Engine deprecation rows require one FULL `source.trigger_reindex`** — the F17 project-only reindex (and `trigger_project_reindex`) covers project symbols only, not engine deprecations. Until that full pass runs, `check_deprecations` returns the `index_state: "empty"` state above.
+
+**`build_cs_path` backfill:** the same Phase 1 indexer change backfills the `modules.build_cs_path` column (previously inserted empty). `DiscoverProjectModules` / `DiscoverEngineModules` derive each module's `<Module>.Build.cs` path from its `Source/<Module>/` dir. `get_include_path`'s `build_cs_note` reads this populated column. Existing DBs pick up the value on the same full `trigger_reindex` bootstrap.
 
 ---

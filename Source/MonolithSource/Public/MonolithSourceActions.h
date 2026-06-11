@@ -14,6 +14,27 @@ class FMonolithSourceActions
 public:
 	static void RegisterAll();
 
+	// Public for unit testing (MonolithCppErgonomicsTest.cpp) — pure, stateless helpers.
+	/**
+	 * Derive the canonical #include form from an indexed file path. A path under
+	 * Public/ | Classes/ | Internal/ strips that prefix and returns an includable
+	 * cross-module form (bOutIncludable = true). A Private/ path is NOT includable
+	 * from another module: bOutIncludable = false, the same-module relative form is
+	 * returned, and OutWarning carries the not-includable note. No recognised prefix
+	 * (e.g. an engine header outside the Public/Private convention) -> basename
+	 * fallback. Always forward-slashed.
+	 */
+	static FString DeriveIncludePath(const FString& IndexedFilePath, bool& bOutIncludable, FString& OutWarning);
+
+	/**
+	 * Compact a (possibly multi-line) declaration into a single-line signature:
+	 * accumulates from StartIdx forward to the closing of the parameter list and
+	 * the terminating `;` or opening `{`, strips trailing macro `\` continuations
+	 * and any inline body, and collapses whitespace. Used by get_signature
+	 * (item 2) for the declaration-read path and exposed for unit testing.
+	 */
+	static FString CompactDeclaration(const TArray<FString>& Lines, int32 StartIdx);
+
 private:
 	// Action handlers
 	static FMonolithActionResult HandleReadSource(const TSharedPtr<FJsonObject>& Params);
@@ -28,9 +49,18 @@ private:
 	static FMonolithActionResult HandleTriggerReindex(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleTriggerProjectReindex(const TSharedPtr<FJsonObject>& Params);
 
+	// Phase 1 — demand-proven lookups (LLM C++ authoring ergonomics)
+	static FMonolithActionResult HandleGetIncludePath(const TSharedPtr<FJsonObject>& Params);    // item 1
+	static FMonolithActionResult HandleGetSignature(const TSharedPtr<FJsonObject>& Params);      // item 2
+	static FMonolithActionResult HandleCheckDeprecations(const TSharedPtr<FJsonObject>& Params); // item 3
+
 	// Helpers
 	static FMonolithSourceDatabase* GetDB();
 	static FString ShortPath(const FString& FullPath);
+
+	/** Resolve the owning module name (+ Build.cs note) for a symbol via the source DB (files->modules join). */
+	static bool ResolveOwningModule(FMonolithSourceDatabase* DB, const FString& Symbol, FString& OutModule, FString& OutBuildCsNote);
+
 	static FString ReadFileLines(const FString& FilePath, int32 StartLine, int32 EndLine);
 	static bool IsForwardDeclaration(const FString& FilePath, int32 LineStart, int32 LineEnd);
 	static FString ExtractMembers(const FString& FilePath, int32 StartLine, int32 EndLine);

@@ -834,6 +834,223 @@ class SourceActions:
         source = self.read_file_lines(resolved, start, end)
         print(f"{header}\n{source}")
 
+    # ============================================================
+    # Phase 1 — LLM C++ authoring ergonomics (items 1-3). Byte-equivalent to the
+    # monolith_query.exe SourceActions methods (parity-gated).
+    # ============================================================
+
+    @staticmethod
+    def derive_include_path(indexed_path, module_name):
+        """Mirror of FMonolithSourceActions::DeriveIncludePath.
+        Returns (include, includable, warning)."""
+        path = (indexed_path or "").replace("\\", "/")
+        for root in ("/Public/", "/Classes/", "/Internal/"):
+            idx = path.rfind(root)
+            if idx >= 0:
+                return path[idx + len(root):], True, ""
+        pidx = path.rfind("/Private/")
+        if pidx >= 0:
+            warn = ("Private header -- not includable outside "
+                    + (module_name if module_name else "its module")
+                    + "; same-module include shown")
+            return path[pidx + len("/Private/"):], False, warn
+        slash = path.rfind("/")
+        return (path if slash < 0 else path[slash + 1:]), True, ""
+
+    def resolve_symbol_row(self, symbol):
+        lookup = symbol
+        scope = symbol.rfind("::")
+        if scope >= 0:
+            lookup = symbol[:scope]
+        rows = self.db.execute(
+            "SELECT id, name, file_id FROM symbols WHERE name = ? ORDER BY (line_end > line_start) DESC",
+            (lookup,)).fetchall()
+        if not rows:
+            fts_q = escape_fts(lookup)
+            rows = self.db.execute(
+                "SELECT s.id, s.name, s.file_id FROM symbols_fts f JOIN symbols s ON s.id = f.rowid "
+                "WHERE symbols_fts MATCH ? LIMIT 5", (fts_q,)).fetchall()
+        return rows[0] if rows else None
+
+    def get_include_path(self, args):
+        symbol = args.symbol
+        sym = self.resolve_symbol_row(symbol)
+        if not sym:
+            print(f"No symbol found matching '{symbol}'.", file=sys.stderr)
+            sys.exit(1)
+
+        file_id = sym["file_id"]
+        lookup = symbol
+        scope = symbol.rfind("::")
+        if scope >= 0:
+            lookup = symbol[:scope]
+        allrows = self.db.execute(
+            "SELECT s.file_id, f.path FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.name = ?",
+            (lookup,)).fetchall()
+        file_path = self.get_file_path(file_id)
+        for r in allrows:
+            p = r["path"]
+            if p.endswith(".h"):
+                file_id = r["file_id"]
+                file_path = p
+                break
+
+        mrows = self.db.execute(
+            "SELECT m.name, m.build_cs_path FROM files f JOIN modules m ON m.id = f.module_id WHERE f.id = ?",
+            (file_id,)).fetchall()
+        module_name = mrows[0]["name"] if mrows else ""
+        build_cs = mrows[0]["build_cs_path"] if mrows else ""
+
+        include, includable, warning = self.derive_include_path(file_path, module_name)
+
+        build_cs_note = ""
+        if module_name:
+            if build_cs:
+                base = build_cs.replace("\\", "/").rsplit("/", 1)[-1]
+                build_cs_note = f"Module '{module_name}' -- add to your Build.cs deps ({base})"
+            else:
+                build_cs_note = f"Module '{module_name}' -- add to your Build.cs deps"
+
+        out = [f'#include "{include}"']
+        if module_name:
+            out.append(f"Module: {module_name}")
+        if build_cs_note:
+            out.append(build_cs_note)
+        if warning:
+            out.append(f"WARNING: {warning}")
+        print("\n".join(out))
+
+    @staticmethod
+    def compact_declaration(lines, start_idx):
+        """Mirror of FMonolithSourceActions::CompactDeclaration."""
+        accum = []
+        paren_depth = 0
+        saw_open = False
+        for i in range(start_idx, min(len(lines), start_idx + 12)):
+            line = lines[i].rstrip()
+            if line.endswith("\\"):
+                line = line[:-1].rstrip()
+            done = False
+            for c, ch in enumerate(line):
+                if ch == "(":
+                    paren_depth += 1
+                    saw_open = True
+                elif ch == ")":
+                    paren_depth = max(0, paren_depth - 1)
+                elif paren_depth == 0 and saw_open and ch in ("{", ";"):
+                    # Prefix already accumulated char-by-char above; just stop
+                    # (re-appending line[:c] duplicated the tail).
+                    done = True
+                    break
+                else:
+                    accum.append(ch)
+                    continue
+                accum.append(ch)
+            if done:
+                break
+            accum.append(" ")
+        # collapse whitespace
+        raw = "".join(accum)
+        out = []
+        prev_space = False
+        for ch in raw:
+            if ch in (" ", "\t", "\r", "\n"):
+                if not prev_space:
+                    out.append(" ")
+                prev_space = True
+            else:
+                out.append(ch)
+                prev_space = False
+        return "".join(out).strip()
+
+    def get_signature(self, args):
+        symbol = args.symbol
+        limit = args.limit
+        method = symbol
+        scope = symbol.rfind("::")
+        if scope >= 0:
+            method = symbol[scope + 2:]
+
+        overloads = []  # (sig, source, file, line)
+
+        fnrows = self.db.execute(
+            "SELECT signature, file_id, line_start FROM symbols WHERE name = ? AND kind = 'function'",
+            (method,)).fetchall()
+        for r in fnrows:
+            if len(overloads) >= limit:
+                break
+            sig = r["signature"] or ""
+            if not sig:
+                continue
+            if "{" in sig or "\\" in sig:
+                continue
+            sig = sig.strip()
+            overloads.append((sig, "column", self.short_path(self.get_file_path(r["file_id"])), r["line_start"]))
+
+        if not overloads:
+            fts_q = escape_fts(symbol)
+            chunks = self.db.execute(
+                "SELECT file_id, line_number, text FROM source_fts WHERE source_fts MATCH ? "
+                "ORDER BY bm25(source_fts) LIMIT 50", (fts_q,)).fetchall()
+            seen = set()
+            needle = method + "("
+            for ch in chunks:
+                if len(overloads) >= limit:
+                    break
+                fp = self.get_file_path(ch["file_id"])
+                try:
+                    with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                        file_lines = [ln.rstrip("\n") for ln in f.readlines()]
+                except FileNotFoundError:
+                    continue
+                win_start = max(0, ch["line_number"] - 1)
+                win_end = min(len(file_lines), win_start + 10)
+                for i in range(win_start, win_end):
+                    if len(overloads) >= limit:
+                        break
+                    line = file_lines[i]
+                    didx = line.find(needle)
+                    if didx < 0:
+                        continue
+                    if didx > 0:
+                        prev = line[didx - 1]
+                        if prev.isalnum() or prev == "_":
+                            continue
+                    sig = self.compact_declaration(file_lines, i)
+                    if not sig or needle not in sig:
+                        continue
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    overloads.append((sig, "declaration_read", self.short_path(fp), i + 1))
+
+        if not overloads:
+            print(f"No signature found for '{symbol}'.", file=sys.stderr)
+            sys.exit(1)
+
+        out = []
+        for sig, source, fp, line in overloads:
+            out.append(f"{sig}\n  // {source} @ {fp}:{line}")
+        print("\n".join(out))
+
+    def check_deprecations(self, args):
+        symbols = args.symbols
+        total = self.db.execute("SELECT COUNT(*) as c FROM symbol_deprecations").fetchone()["c"]
+        if total == 0:
+            print("Deprecation index is empty (schema v2 landed but not yet populated). "
+                  "Run source.trigger_reindex to populate it.")
+            return
+        lines = []
+        for name in symbols:
+            row = self.db.execute(
+                "SELECT version, message, kind FROM symbol_deprecations WHERE symbol_name = ? LIMIT 1",
+                (name,)).fetchone()
+            if row:
+                lines.append(f"{name}: DEPRECATED ({row['version']}) [{row['kind']}] {row['message']}")
+            else:
+                lines.append(f"{name}: not deprecated")
+        print("\n".join(lines))
+
 
 # ============================================================
 # Project actions (UNCHANGED — do not touch)
@@ -1878,6 +2095,16 @@ def build_parser():
     p.add_argument("file_path")
     p.add_argument("--start", type=int, default=1)
     p.add_argument("--end", type=int, default=0)
+
+    p = src_sub.add_parser("get_include_path")
+    p.add_argument("symbol")
+
+    p = src_sub.add_parser("get_signature")
+    p.add_argument("symbol")
+    p.add_argument("--limit", type=int, default=10)
+
+    p = src_sub.add_parser("check_deprecations")
+    p.add_argument("symbols", nargs="+")
 
     # --- project namespace ---
     prj = sub.add_parser("project", help="Query project index database")

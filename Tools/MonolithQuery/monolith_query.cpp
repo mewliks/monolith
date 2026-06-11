@@ -364,6 +364,9 @@ static Args parse_args(int argc, char* argv[]) {
                   << "  get_module_info <module_name>\n"
                   << "  get_symbol_context <symbol> [--context-lines=N]\n"
                   << "  read_file <file_path> [--start=N] [--end=N]\n"
+                  << "  get_include_path <symbol>\n"
+                  << "  get_signature <symbol> [--limit=N]\n"
+                  << "  check_deprecations <symbol> [<symbol> ...]\n"
                   << "\nProject actions:\n"
                   << "  search <query> [--limit=N]\n"
                   << "  find_by_type <asset_class> [--limit=N] [--offset=N]\n"
@@ -969,6 +972,279 @@ public:
 
         std::cout << "--- " << short_path(resolved) << " (lines " << start << "-" << end << ") ---\n";
         std::cout << read_file_lines(resolved, start, end) << std::endl;
+    }
+
+    // ============================================================
+    // Phase 1 — LLM C++ authoring ergonomics (items 1-3). Mirrors the live
+    // FMonolithSourceActions handlers' content[].text rendering for parity.
+    // ============================================================
+
+    // Mirror of FMonolithSourceActions::DeriveIncludePath.
+    static std::string derive_include_path(const std::string& indexed_path,
+                                           bool& out_includable, std::string& out_warning,
+                                           const std::string& module_name) {
+        out_includable = true;
+        out_warning.clear();
+
+        std::string path = indexed_path;
+        std::replace(path.begin(), path.end(), '\\', '/');
+
+        auto rfind_ci = [](const std::string& hay, const std::string& needle) -> size_t {
+            return hay.rfind(needle);
+        };
+
+        static const char* roots[] = { "/Public/", "/Classes/", "/Internal/" };
+        for (const char* root : roots) {
+            size_t idx = rfind_ci(path, root);
+            if (idx != std::string::npos) {
+                out_includable = true;
+                return path.substr(idx + std::string(root).size());
+            }
+        }
+
+        size_t pidx = rfind_ci(path, "/Private/");
+        if (pidx != std::string::npos) {
+            out_includable = false;
+            out_warning = "Private header -- not includable outside "
+                + (module_name.empty() ? std::string("its module") : module_name)
+                + "; same-module include shown";
+            return path.substr(pidx + std::string("/Private/").size());
+        }
+
+        // basename fallback
+        size_t slash = path.find_last_of('/');
+        out_includable = true;
+        return (slash == std::string::npos) ? path : path.substr(slash + 1);
+    }
+
+    // Resolve a symbol (or Class::Method) to its owning file row.
+    Row resolve_symbol_row(const std::string& symbol, bool& found) {
+        found = false;
+        std::string lookup = symbol;
+        size_t scope = symbol.rfind("::");
+        if (scope != std::string::npos) lookup = symbol.substr(0, scope);
+
+        auto rows = query(db,
+            "SELECT id, name, file_id FROM symbols WHERE name = ? ORDER BY (line_end > line_start) DESC",
+            {lookup});
+        if (rows.empty()) {
+            std::string fts_q = escape_fts(lookup);
+            rows = query(db,
+                "SELECT s.id, s.name, s.file_id FROM symbols_fts f JOIN symbols s ON s.id = f.rowid "
+                "WHERE symbols_fts MATCH ? LIMIT 5", {fts_q});
+        }
+        if (rows.empty()) return Row{};
+        found = true;
+        return rows[0];
+    }
+
+    // --- get_include_path ---
+    void get_include_path(const Args& args) {
+        if (args.positional.empty()) die("get_include_path requires a symbol argument");
+        std::string symbol = args.positional[0];
+
+        bool found = false;
+        Row sym = resolve_symbol_row(symbol, found);
+        if (!found) die("No symbol found matching '" + symbol + "'.");
+
+        int file_id = sym.get_int("file_id");
+
+        // Prefer a header file among same-name rows.
+        std::string lookup = symbol;
+        size_t scope = symbol.rfind("::");
+        if (scope != std::string::npos) lookup = symbol.substr(0, scope);
+        auto allrows = query(db,
+            "SELECT s.file_id, f.path FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.name = ?",
+            {lookup});
+        std::string file_path = get_file_path(file_id);
+        for (auto& r : allrows) {
+            std::string p = r.get("path");
+            if (p.size() >= 2 && p.substr(p.size() - 2) == ".h") {
+                file_id = r.get_int("file_id");
+                file_path = p;
+                break;
+            }
+        }
+
+        // Module + build_cs_path
+        auto mrows = query(db,
+            "SELECT m.name, m.build_cs_path FROM files f JOIN modules m ON m.id = f.module_id WHERE f.id = ?",
+            {std::to_string(file_id)});
+        std::string module_name = mrows.empty() ? "" : mrows[0].get("name");
+        std::string build_cs = mrows.empty() ? "" : mrows[0].get("build_cs_path");
+
+        bool includable = true;
+        std::string warning;
+        std::string include = derive_include_path(file_path, includable, warning, module_name);
+
+        std::string build_cs_note;
+        if (!module_name.empty()) {
+            if (!build_cs.empty()) {
+                size_t s = build_cs.find_last_of("/\\");
+                std::string base = (s == std::string::npos) ? build_cs : build_cs.substr(s + 1);
+                build_cs_note = "Module '" + module_name + "' -- add to your Build.cs deps (" + base + ")";
+            } else {
+                build_cs_note = "Module '" + module_name + "' -- add to your Build.cs deps";
+            }
+        }
+
+        std::cout << "#include \"" << include << "\"";
+        if (!module_name.empty()) std::cout << "\nModule: " << module_name;
+        if (!build_cs_note.empty()) std::cout << "\n" << build_cs_note;
+        if (!warning.empty()) std::cout << "\nWARNING: " << warning;
+        std::cout << std::endl;
+    }
+
+    // Mirror of FMonolithSourceActions::CompactDeclaration.
+    static std::string compact_declaration(const std::vector<std::string>& lines, int start_idx) {
+        std::string accum;
+        int paren_depth = 0;
+        bool saw_open = false;
+        for (int i = start_idx; i < (int)lines.size() && i < start_idx + 12; ++i) {
+            std::string line = lines[i];
+            // trim trailing ws
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t'))
+                line.pop_back();
+            if (!line.empty() && line.back() == '\\') {
+                line.pop_back();
+                while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
+            }
+            bool done = false;
+            for (size_t c = 0; c < line.size(); ++c) {
+                char ch = line[c];
+                if (ch == '(') { paren_depth++; saw_open = true; }
+                else if (ch == ')') { paren_depth = std::max(0, paren_depth - 1); }
+                else if (paren_depth == 0 && saw_open && (ch == '{' || ch == ';')) {
+                    // Prefix already accumulated char-by-char above; just stop
+                    // (re-appending line.substr(0,c) duplicated the tail).
+                    done = true;
+                    break;
+                }
+                accum += ch;
+            }
+            if (done) break;
+            accum += " ";
+        }
+        // collapse whitespace
+        std::string out;
+        bool prev_space = false;
+        for (char ch : accum) {
+            if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+                if (!prev_space) out += ' ';
+                prev_space = true;
+            } else { out += ch; prev_space = false; }
+        }
+        // trim
+        size_t b = out.find_first_not_of(' ');
+        size_t e = out.find_last_not_of(' ');
+        return (b == std::string::npos) ? "" : out.substr(b, e - b + 1);
+    }
+
+    // --- get_signature ---
+    void get_signature(const Args& args) {
+        if (args.positional.empty()) die("get_signature requires a symbol argument");
+        std::string symbol = args.positional[0];
+        int limit = args.opt_int("limit", 10);
+
+        std::string method = symbol;
+        size_t scope = symbol.rfind("::");
+        if (scope != std::string::npos) method = symbol.substr(scope + 2);
+
+        struct Overload { std::string sig, source, file; int line = 0; };
+        std::vector<Overload> overloads;
+
+        // Fast path: body-free signature column.
+        auto fnrows = query(db,
+            "SELECT signature, file_id, line_start FROM symbols WHERE name = ? AND kind = 'function'",
+            {method});
+        for (auto& r : fnrows) {
+            if ((int)overloads.size() >= limit) break;
+            std::string sig = r.get("signature");
+            if (sig.empty()) continue;
+            if (sig.find('{') != std::string::npos || sig.find('\\') != std::string::npos) continue;
+            // trim
+            size_t b = sig.find_first_not_of(" \t\r\n");
+            size_t e = sig.find_last_not_of(" \t\r\n");
+            sig = (b == std::string::npos) ? "" : sig.substr(b, e - b + 1);
+            overloads.push_back({sig, "column", short_path(get_file_path(r.get_int("file_id"))), r.get_int("line_start")});
+        }
+
+        // Primary: declaration-read via source_fts.
+        if (overloads.empty()) {
+            std::string fts_q = escape_fts(symbol);
+            auto chunks = query(db,
+                "SELECT file_id, line_number, text FROM source_fts WHERE source_fts MATCH ? "
+                "ORDER BY bm25(source_fts) LIMIT 50", {fts_q});
+            std::set<std::string> seen;
+            std::string needle = method + "(";
+            for (auto& ch : chunks) {
+                if ((int)overloads.size() >= limit) break;
+                std::string fp = get_file_path(ch.get_int("file_id"));
+                std::ifstream f(fp);
+                if (!f.is_open()) continue;
+                std::vector<std::string> file_lines;
+                std::string l;
+                while (std::getline(f, l)) file_lines.push_back(l);
+                int win_start = std::max(0, ch.get_int("line_number") - 1);
+                int win_end = std::min((int)file_lines.size(), win_start + 10);
+                for (int i = win_start; i < win_end; ++i) {
+                    if ((int)overloads.size() >= limit) break;
+                    const std::string& line = file_lines[i];
+                    size_t didx = line.find(needle);
+                    if (didx == std::string::npos) continue;
+                    if (didx > 0) {
+                        char prev = line[didx - 1];
+                        if (std::isalnum((unsigned char)prev) || prev == '_') continue;
+                    }
+                    std::string sig = compact_declaration(file_lines, i);
+                    if (sig.empty() || sig.find(needle) == std::string::npos) continue;
+                    if (seen.count(sig)) continue;
+                    seen.insert(sig);
+                    overloads.push_back({sig, "declaration_read", short_path(fp), i + 1});
+                }
+            }
+        }
+
+        if (overloads.empty()) die("No signature found for '" + symbol + "'.");
+
+        for (size_t i = 0; i < overloads.size(); ++i) {
+            if (i > 0) std::cout << "\n";
+            std::cout << overloads[i].sig << "\n  // " << overloads[i].source
+                      << " @ " << overloads[i].file << ":" << overloads[i].line;
+        }
+        std::cout << std::endl;
+    }
+
+    // --- check_deprecations ---
+    void check_deprecations(const Args& args) {
+        if (args.positional.empty()) die("check_deprecations requires one or more symbol arguments");
+
+        // Empty index -> clean "empty" state (Decision 3).
+        auto cnt = query(db, "SELECT COUNT(*) as c FROM symbol_deprecations", {});
+        int total = cnt.empty() ? 0 : cnt[0].get_int("c");
+        if (total == 0) {
+            std::cout << "Deprecation index is empty (schema v2 landed but not yet populated). "
+                         "Run source.trigger_reindex to populate it." << std::endl;
+            return;
+        }
+
+        std::vector<std::string> lines;
+        for (const auto& name : args.positional) {
+            auto rows = query(db,
+                "SELECT version, message, kind FROM symbol_deprecations WHERE symbol_name = ? LIMIT 1",
+                {name});
+            if (!rows.empty()) {
+                lines.push_back(name + ": DEPRECATED (" + rows[0].get("version") + ") ["
+                    + rows[0].get("kind") + "] " + rows[0].get("message"));
+            } else {
+                lines.push_back(name + ": not deprecated");
+            }
+        }
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (i > 0) std::cout << "\n";
+            std::cout << lines[i];
+        }
+        std::cout << std::endl;
     }
 };
 
@@ -2941,6 +3217,9 @@ int main(int argc, char* argv[]) {
             {"get_module_info",     [](SourceActions& s, const Args& a) { s.get_module_info(a); }},
             {"get_symbol_context",  [](SourceActions& s, const Args& a) { s.get_symbol_context(a); }},
             {"read_file",           [](SourceActions& s, const Args& a) { s.read_file(a); }},
+            {"get_include_path",    [](SourceActions& s, const Args& a) { s.get_include_path(a); }},
+            {"get_signature",       [](SourceActions& s, const Args& a) { s.get_signature(a); }},
+            {"check_deprecations",  [](SourceActions& s, const Args& a) { s.check_deprecations(a); }},
         };
 
         auto it = actions.find(args.action);

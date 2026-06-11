@@ -3,19 +3,22 @@
 verify_offline_parity.py -- HARD-GATE parity guard for the two offline Monolith RI tools.
 
 Byte/deep-diffs the C++ exe (Binaries/monolith_query.exe) against the Python
-reference (Scripts/monolith_offline.py) across all 20 Reflection-Intelligence
-(RI) actions spanning 4 namespaces: cppreflect, network, decision, risk.
+reference (Scripts/monolith_offline.py) across 23 actions: 20 Reflection-
+Intelligence (RI) actions spanning 4 namespaces (cppreflect, network, decision,
+risk; JSON deep-diff) PLUS 3 source-ergonomics actions (get_include_path,
+get_signature, check_deprecations; plain-text STRICT byte-compare).
 
 This is the acceptance test for the offline-parity sprint. Strict mode (default)
-requires every action to deep-equal, INCLUDING the opaque base64 `next_cursor`
-bytes -- which means the two tools must compute identical filter-hashes (qh).
+requires every JSON action to deep-equal (INCLUDING the opaque base64
+`next_cursor` bytes -- so the two tools must compute identical filter-hashes qh)
+and every text action's raw stdout to byte-match (trailing newline normalised).
 
 Usage (run from the Monolith plugin root):
     python Scripts/verify_offline_parity.py
     python Scripts/verify_offline_parity.py --ignore-cursor-bytes
     python Scripts/verify_offline_parity.py --live          # FUTURE stub, see below
 
-Exit code 0 IFF all 20 actions deep-equal in the active mode AND --version
+Exit code 0 IFF all 23 actions match in the active mode AND --version
 parity-rev matches. Non-zero otherwise.
 
 stdlib-only. Do not add third-party deps.
@@ -254,8 +257,14 @@ def discover_chain_inputs():
 
 def build_actions(chain):
     """
-    The 20 RI actions with deterministic representative args.
-    Each entry: (label, namespace, action, [args]).
+    The 20 RI actions + 3 source actions with deterministic representative args.
+    Each entry: (label, namespace, action, [args]) -- JSON deep-diff (default), OR
+    (label, namespace, action, [args], "text") -- raw-stdout STRICT byte-compare.
+
+    The RI namespaces (cppreflect/network/decision/risk) emit JSON, so they are
+    deep-diffed. The source.* ergonomics actions emit plain text (mirroring the
+    live handlers' content[].text rendering), so they are compared as raw stdout
+    bytes -- a STRICTER check than JSON (every byte must match).
     """
     cls = chain["uclass"]
     did = chain["decision_id"]
@@ -294,6 +303,18 @@ def build_actions(chain):
         ("risk.get_file_churn", "risk", "get_file_churn", [rpath]),
         ("risk.get_release_window_hotspots", "risk", "get_release_window_hotspots", []),
         ("risk.list_conditional_gates", "risk", "list_conditional_gates", []),
+
+        # ---- source ergonomics (3) -- plain-text output, STRICT byte-compare ----
+        # Deterministic fixed inputs (no chaining):
+        #   AActor                          -> stable engine class header
+        #   UGameplayStatics::ApplyDamage   -> stable class-body method (declaration_read)
+        #   PreparePathfinding              -> known 4.13 UE_DEPRECATED_FORGAME verdict
+        #   AActor (2nd check_deprecations) -> known not-deprecated
+        ("source.get_include_path", "source", "get_include_path", ["AActor"], "text"),
+        ("source.get_signature", "source", "get_signature",
+         ["UGameplayStatics::ApplyDamage"], "text"),
+        ("source.check_deprecations", "source", "check_deprecations",
+         ["PreparePathfinding", "AActor"], "text"),
     ]
     return actions
 
@@ -313,13 +334,18 @@ def fetch_live(ns, action, args):
 # ------------------------------------------------------------------ per-action
 
 
-def run_action(label, ns, action, args, ignore_cursor_bytes):
+def run_action(label, ns, action, args, ignore_cursor_bytes, compare="json"):
     """
     Returns a result dict:
       status: MATCH | DIFF | ERROR
       diffs:  list of (path, exe_val, py_val)
       warnings: list of (path, exe_val, py_val)
       error:  str | None
+
+    compare="json" (default): parse both stdouts as JSON and deep-diff.
+    compare="text": STRICT raw-stdout byte-compare (the source.* ergonomics
+    actions emit plain text, not JSON). Trailing newlines are normalised so a
+    lone print() newline difference is not a false DIFF; all other bytes must match.
     """
     res = {"label": label, "args": args, "status": None,
            "diffs": [], "warnings": [], "error": None}
@@ -332,6 +358,22 @@ def run_action(label, ns, action, args, ignore_cursor_bytes):
         err_parts.append(f"EXE exit={erc} stderr={eerr.strip()[:400]!r}")
     if prc != 0:
         err_parts.append(f"PY exit={prc} stderr={perr.strip()[:400]!r}")
+
+    if err_parts:
+        res["status"] = "ERROR"
+        res["error"] = " | ".join(err_parts)
+        return res
+
+    if compare == "text":
+        # Normalise only trailing newline(s); interior bytes must match exactly.
+        etext = (eout or "").rstrip("\n")
+        ptext = (pout or "").rstrip("\n")
+        if etext != ptext:
+            res["diffs"] = [("<stdout-text>", etext, ptext)]
+            res["status"] = "DIFF"
+        else:
+            res["status"] = "MATCH"
+        return res
 
     edata = pdata = None
     try:
@@ -433,8 +475,11 @@ def main():
 
     actions = build_actions(chain)
     results = []
-    for label, ns, action, aargs in actions:
-        results.append(run_action(label, ns, action, aargs, args.ignore_cursor_bytes))
+    for entry in actions:
+        # Entries are (label, ns, action, args) or (..., compare). Default JSON.
+        label, ns, action, aargs = entry[0], entry[1], entry[2], entry[3]
+        compare = entry[4] if len(entry) > 4 else "json"
+        results.append(run_action(label, ns, action, aargs, args.ignore_cursor_bytes, compare))
 
     n_match = sum(1 for r in results if r["status"] == "MATCH")
     n_diff = sum(1 for r in results if r["status"] == "DIFF")
