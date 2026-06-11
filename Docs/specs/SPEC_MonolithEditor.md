@@ -8,18 +8,20 @@
 
 ## MonolithEditor
 
-**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, Json, JsonUtilities, MessageLog, LiveCoding (Win64 only)
+**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, Json, JsonUtilities, MessageLog, EnhancedInput, LiveCoding (Win64 only)
+
+> **`EnhancedInput` dep (Gap 4, 2026-06-10):** added for `pie_inject_input_action` (`UEnhancedInputLocalPlayerSubsystem::InjectInputForAction`). It is a stock, always-enabled engine plugin module — release-build safe, so it carries no `WITH_*` gate (same rationale as the existing `AIModule` dep).
 
 ### Classes
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithEditorModule` | Creates FMonolithLogCapture, attaches to GLog, subscribes a `FCoreDelegates::PreSlateModal` watcher (see Module-Level Modal Watcher below), registers ~43 actions (20 base + 2 Phase J F8 map actions + 2 v0.14.8 PR #48 automation + 2 v0.14.9 Issue #50 scripting + 3 v0.14.10 PR #54 PIE/console + 4 v0.16.0 preview & inspection + 7 test/profiling harness Wave 1 + 1 test/profiling harness Wave 2 `list_errored_blueprints` + 1 test/profiling harness Wave 3 `capture_anim_frames` + 1 (2026-06-07) `author_map_settings`) |
+| `FMonolithEditorModule` | Creates FMonolithLogCapture, attaches to GLog, subscribes a `FCoreDelegates::PreSlateModal` watcher (see Module-Level Modal Watcher below), registers ~50 actions (20 base + 2 Phase J F8 map actions + 2 v0.14.8 PR #48 automation + 2 v0.14.9 Issue #50 scripting + 3 v0.14.10 PR #54 PIE/console + 4 v0.16.0 preview & inspection + 7 test/profiling harness Wave 1 + 1 test/profiling harness Wave 2 `list_errored_blueprints` + 1 test/profiling harness Wave 3 `capture_anim_frames` + 1 (2026-06-07) `author_map_settings` + introspection-gap pass 2026-06-10: 2 live-PIE object (`pie_get_object_properties`, `pie_call_function`, Gap 8) + 3 PIE input/control (Gap 4) + 1 stat readout (Gap 10). `sample_pie_timeseries` (Gap 9) is implemented here but registered under the `animation` namespace, so it is not counted in this module's `editor`-namespace total.) |
 | `FMonolithLogCapture` | FOutputDevice subclass. Ring buffer (10,000 entries max). Thread-safe. Tracks counts by verbosity |
 | `FMonolithEditorActions` | Static handlers for build and log operations. Hooks into `ILiveCodingModule::GetOnPatchCompleteDelegate()` to capture compile results and timestamps |
 | `FMonolithSettingsCustomization` | IDetailCustomization for UMonolithSettings. Adds re-index buttons for project and source databases in Project Settings UI |
 
-### Actions (~43 — namespace: "editor")
+### Actions (~50 — namespace: "editor")
 
 > **Counts are approximate.** Exact integers are no longer tracked to the unit — query `monolith_discover("editor")` for the live figure.
 
@@ -136,6 +138,22 @@ Plus `capture_scene_preview` (in Base section above) was **extended** in v0.16.0
 **Time-series PIE sampling (Gap 9 — registered under the `animation` namespace; `MonolithPieTimeseries.cpp` + `MonolithEditorActions::StartTimeseriesSession`)**
 
 `sample_pie_timeseries` is IMPLEMENTED in MonolithEditor (it reuses the async PIE-smoke session machinery — `FPieSmokeSessionManager`, the shared frame observer, `poll_pie_smoke`/`stop_pie_smoke`) but REGISTERED under the **`animation`** namespace string (the registry is namespace-string-keyed; verification ergonomics match `sample_pie_anim_instance`). Async lifecycle identical to `run_pie_smoke`: returns `{session_id, status:'running'}`; poll/stop via the existing PIE-smoke actions. Per sample tick it reads dotted UDS-friendly `variables[]` off the resolved target (gated by `sample_interval`, capped by `max_samples`) and fires typed `provocations[]` once each when session-elapsed crosses `time`: `set_control_rotation` (`APlayerController::SetControlRotation`), `add_movement_input` (`APawn::AddMovementInput`), `jump` (`ACharacter::Jump` — target must be a Character), `console_command` (PIE console exec). `poll_pie_smoke` returns the full per-sample `[{t, vars:{...}}]` under `timeseries` (gated by completion / `include_samples`) and the provocation fire log under `provocations`. World-validity + `BeginTearingDown` teardown guards are inherited from the smoke session.
+
+**Deterministic PIE input / control driving (Gap 4 — 3 — `MonolithPieInputActions.cpp`; 2026-06-10)**
+
+Scripted, camera-independent PIE driving. Adds the `EnhancedInput` Build.cs dep (see Dependencies note above). All three **mutate live PIE state** and no-op with a clean error when PIE is not running.
+
+| Action | Description |
+|--------|-------------|
+| `pie_set_control_rotation` | Set the control rotation on a PIE player controller (`APlayerController::SetControlRotation`). Params: `pitch` / `yaw` / `roll` (degrees, omitted components default to 0), optional `player_index` (default 0). `hold_frames` (default 0) re-applies the rotation each frame for that many frames so it can outlast a per-tick camera/control system that re-writes `ControlRotation` — **best-effort, not frame-perfect**: a camera director that runs later in the frame can still win that frame. The re-apply hook clears itself on PIE end. |
+| `pie_inject_input_action` | Inject a value for an Enhanced Input action into a live PIE local player (`UEnhancedInputLocalPlayerSubsystem::InjectInputForAction`), running that action's modifiers and triggers as if real input arrived. `input_action` is a UInputAction asset path (`/Game/...`) or short asset name (registry-resolved, first match). `value` maps to `FInputActionValue` by JSON shape: bool → Boolean, number → Axis1D, array[2] → Axis2D, array[3] → Axis3D. Optional `player_index` (default 0); `repeat_frames` (default 1) re-injects each frame. |
+| `pie_possess_spectator_free` | Detach a PIE player controller to a free-fly spectator pawn, or re-possess the original. `enable=true` stores + unpossesses the current pawn and enters the Spectating state (`ChangeState(NAME_Spectating)`, which spawns a spectator pawn from the game mode's `SpectatorClass`); `enable=false` re-possesses the stored original (`ChangeState(NAME_Playing)` + Possess). The original is held as a weak pointer, cleared on PIE end. Note: free-fly spawning depends on the game mode providing a `SpectatorClass`; with none configured the controller still enters Spectating but no pawn is created. Optional `player_index` (default 0). |
+
+**Stat-group counter readout (Gap 10 — 1 — `MonolithStatActions.cpp`; 2026-06-10)**
+
+| Action | Description |
+|--------|-------------|
+| `get_stat_group_values` | Read a stats group programmatically into a structured response. Enables high-performance collection for `group_name` (full `STATGROUP_Anim` or short `Anim` form; project-defined groups work the same), reads the most recent settled stat frame(s) from the stats thread, and returns each stat's counter value (int64/double) and cycle-stat timing in milliseconds. `sample_frames` (default 1; >1 aggregates per-stat min/avg/max over the last N already-settled frames). A group this action enables is disabled again on completion (a group already collecting is left as-is). **`#if STATS`-gated** — compiled into Development editor builds but NOT Shipping/Test; off-gate the handler returns a clean "stats system not compiled in" error (the registration itself is unconditional). Reads the LIVE stats stream, which only produces frames while overall collection is primary-enabled — for reliable data have stats already active (PIE running with an on-screen stat, or call `run_console_command("stat <group>")` first). If no settled frame exists yet it returns `settled=false` with zero stats; retry once the editor/PIE has advanced a frame with collection active. |
 
 #### Structured `actor_setup` (on the PIE-smoke actions; 2026-06-07)
 
