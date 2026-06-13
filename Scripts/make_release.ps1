@@ -82,7 +82,7 @@ if ($StrippedModules.Count -gt 0) {
 $OutputZip = Join-Path $ProjectDir "Monolith-v$Version.zip"
 $TempDir = Join-Path $env:TEMP "Monolith_Release_$Version"
 $UBT = 'C:\Program Files (x86)\UE_5.7\Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.exe'
-$UProject = Join-Path $ProjectDir "Leviathan.uproject"
+$UProject = Join-Path $ProjectDir "Monolith.uproject"
 
 Write-Host "Building Monolith v$Version release zip..." -ForegroundColor Cyan
 
@@ -97,7 +97,7 @@ if (-not $SkipBuild) {
     try {
         # Non-unity build catches missing includes and unity-only symbol collisions
         # before they reach public releases (feedback_non_unity_build_releases.md).
-        & $UBT LeviathanEditor Win64 Development "-Project=$UProject" -waitmutex -DisableUnity
+        & $UBT MonolithEditor Win64 Development "-Project=$UProject" -waitmutex -DisableUnity
         if ($LASTEXITCODE -ne 0) {
             throw "UBT failed with exit code $LASTEXITCODE. Is the editor closed?"
         }
@@ -185,7 +185,7 @@ if (-not $SkipBuild) {
         # We do NOT throw on a non-zero UBT exit here directly -- a collision is
         # itself a non-zero exit, and we want the filtered diagnostic, not a bare
         # "exit code" message. The collision scan below is the real ship-gate.
-        & $UBT LeviathanEditor Win64 Development "-Project=$UProject" -waitmutex 2>&1 |
+        & $UBT MonolithEditor Win64 Development "-Project=$UProject" -waitmutex 2>&1 |
             Tee-Object -FilePath $UnityLog | Out-Null
         $unityExit = $LASTEXITCODE
 
