@@ -10,6 +10,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+## [0.20.2] - 2026-06-15
+
+### Fixed
+
+- **From-source rebuilds still hard-linked optional plugins MonolithAI couldn't load without.** v0.20.1 rebuilt the shipped release binaries clean, but it didn't fix the source path — so anyone who rebuilt Monolith from source on a stock engine kept hitting the same `GetLastError 126` load failure on `MonolithAI.dll`. The root cause: the optional-plugin gates in `MonolithAI`, `MonolithMesh`, `MonolithIndex`, `MonolithAudio`, and `MonolithAnimation` only checked whether a plugin was **present on disk**. Engine plugins like MassSpawner / ZoneGraph are always on disk, so the gates linked them in even when they weren't enabled in the project, and a stock engine doesn't load them at runtime. Those five `Build.cs` files now read the `.uproject` ProjectDescriptor and gate on whether the plugin is actually **enabled in the project**, not merely present. A from-source build with those plugins disabled now produces a `MonolithAI.dll` with zero MassSpawner / ZoneGraph imports; builds that do enable them keep the features. This is the source-side complement to v0.20.1's binary fix. (#71, reported by @aggitti)
+
+### Internal
+
+- Dropped `GameplayAbilities` from the release import-leak sentinel list — it's a hard dep in `Monolith.uplugin` (auto-enable contract guarantees load order), so it's functionally safe to hard-link and was triggering a false-positive ship block.
+
 ## [0.20.1] - 2026-06-15
 
 ### Fixed
