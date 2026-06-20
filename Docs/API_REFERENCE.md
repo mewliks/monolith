@@ -1,6 +1,6 @@
 # Monolith API Reference
 
-**Version:** v0.20.1 · **Last updated:** 2026-06-15
+**Version:** v0.20.1 · **Last updated:** 2026-06-20
 
 **In-tree action total is approximate: ~1,500+ actions across 25+ in-tree namespaces** (public, in-tree only; all active by default, plus 45 experimental town-gen actions that register only when `bEnableProceduralTownGen=true`). The surface is too large to track to the unit — **query `monolith_discover()` (its `total_actions` field) for the exact live figure.** The `ui` namespace re-exports 4 GAS UI binding actions as aliases. v0.19.0 adds an LLM C++ authoring ergonomics pack (`source`, 8 actions + `editor.get_build_errors` fix hints), live-PIE introspection + driving and stat-group readout (`editor`), anim-node binding read/write and time-series PIE sampling (`animation`), a Blueprint variable census + contract reconciliation (`blueprint`), and T3D asset-text export (`project`); plus two first-launch fixes (issue #70) and a ~40% smaller `tools/list` manifest. The `monolith_*` meta-tools (`discover`, `status`, `update`, `reindex`, `guide`) plus the `bulk_fill_query` and `describe_query` framework dispatchers round out the MCP tool count. This total EXCLUDES sibling-plugin actions — they ship in their own repos and are never in the public release zip.
 
@@ -8,9 +8,9 @@ The per-namespace numbers in the Table of Contents and body sections below are k
 
 > Auto-generated and hand-curated. Each action is dispatched via HTTP POST to `http://localhost:<port>` with JSON body `{ "namespace": "<ns>", "action": "<action>", "params": { ... } }`, or via the MCP `tools/list` surface that AI clients see at session start.
 >
-> For the most current param schemas, call `monolith_discover("<namespace>")` at runtime — it returns live schemas straight out of the plugin. This document is a curated reference, not a source-of-truth substitute.
+> `monolith_discover("<namespace>")` is terse by default — it lists each action's name plus a one-line description, NOT the full param schemas. For a single action's exhaustive live param schema, call `describe_query("action_schema", target_namespace="<ns>", target_action="<name>")`, or pass `detail=true` (alias `verbose=true`) to `monolith_discover` to inline all schemas. Discover also accepts `filter` (case-insensitive substring on name or description), `offset`, and `limit` (default 0 = full list). This document is a curated reference, not a source-of-truth substitute.
 >
-> **0.15.0:** the namespace counts in the Table of Contents and the per-namespace body sections below were regenerated against live `monolith_discover()` on 2026-05-23 — the 0.14.8 → 0.15.0 additions are reflected (the `bulk_fill` / `describe` framework, the blueprint dataset read/edit pack, the UI/Blueprint gap-closure actions, `monolith_guide`, `editor` Python/PIE/console verbs, the `level_sequence` namespace, and the audio MetaSound document-introspection actions). Body sections list every action by category; deep-dive param tables cover the high-traffic ones. For the exhaustive live param schema of any action, call `monolith_discover("<namespace>")` or `describe_query("action_schema", ...)`.
+> **0.15.0:** the namespace counts in the Table of Contents and the per-namespace body sections below were regenerated against live `monolith_discover()` on 2026-05-23 — the 0.14.8 → 0.15.0 additions are reflected (the `bulk_fill` / `describe` framework, the blueprint dataset read/edit pack, the UI/Blueprint gap-closure actions, `monolith_guide`, `editor` Python/PIE/console verbs, the `level_sequence` namespace, and the audio MetaSound document-introspection actions). Body sections list every action by category; deep-dive param tables cover the high-traffic ones. For the exhaustive live param schema of any action, call `describe_query("action_schema", ...)` (or pass `detail=true` to `monolith_discover("<namespace>")`).
 
 ---
 
@@ -69,7 +69,7 @@ The aliased GAS UI binding actions live in **both** `ui::*` and `gas::*` namespa
 
 ## Recent API Changes (v0.14.8 → v0.15.0)
 
-These releases added the `level_sequence` namespace, the `bulk_fill` / `describe` ergonomics framework, a blueprint dataset read/edit pack, a UI/Blueprint gap-closure sweep, `monolith_guide`, and editor automation verbs. The per-namespace body sections below now document these; full param schemas for everything are also live via `monolith_discover("<namespace>")`.
+These releases added the `level_sequence` namespace, the `bulk_fill` / `describe` ergonomics framework, a blueprint dataset read/edit pack, a UI/Blueprint gap-closure sweep, `monolith_guide`, and editor automation verbs. The per-namespace body sections below now document these; full param schemas for everything are live via `describe_query("action_schema", ...)` (or `monolith_discover("<namespace>", detail=true)`).
 
 | Action | Change | Reason |
 |--------|--------|--------|
@@ -154,7 +154,7 @@ Full read/write access to Blueprint graphs, variables, components, functions, no
 - `add_property_access_node` (reflective `K2Node_PropertyAccess` for thread-safe property reads), `set_function_thread_safe` (mark a Blueprint function `BlueprintThreadSafe`). `scaffold_locomotion_anim_values` now emits a fully-wired thread-safe body via Property Access and can target a named function graph.
 - `get_component_details` falls back to inherited native components (reports `is_inherited_native`, `skeletal_mesh`, `anim_class`, `animation_mode`); `get_blueprint_info` adds `native_component_count`; `get_inherited_component_override` reads the effective component template value + source; `seed_data_asset` gained `read_back_values`; `get_cdo_properties` routes through the shared reflection reader as the canonical verify-after-write path.
 
-> For full param schemas, call `monolith_discover("blueprint")` at runtime. The action surface is too broad to enumerate here without bloat — high-traffic actions are documented below; the rest are listed and discoverable.
+> For full param schemas, call `describe_query("action_schema", target_namespace="blueprint", target_action="<name>")` (or `monolith_discover("blueprint", detail=true)`). Plain `monolith_discover("blueprint")` is terse — action names + one-line descriptions only. The action surface is too broad to enumerate here without bloat — high-traffic actions are documented below; the rest are listed and discoverable.
 
 **Action categories:**
 
@@ -201,7 +201,7 @@ Lightweight overview with node id/class/title and exec connections only. ~10 KB 
 
 ### `blueprint.build_blueprint_from_spec`
 
-The crown jewel — author an entire Blueprint (parent class, variables, components, functions, event graph nodes, connections) from a single JSON spec. Validates and compiles in one call. See `monolith_discover("blueprint")` for the full spec schema.
+The crown jewel — author an entire Blueprint (parent class, variables, components, functions, event graph nodes, connections) from a single JSON spec. Validates and compiles in one call. See `describe_query("action_schema", target_namespace="blueprint", target_action="build_blueprint_from_spec")` for the full spec schema.
 
 ### `blueprint.spawn_blueprint_actor`
 
@@ -322,7 +322,7 @@ See `Plugins/Monolith/Docs/specs/SPEC_MonolithBlueprint.md` for the deep dive.
 
 Material graph editing, inspection, CRUD, material functions, instances, custom HLSL nodes, PBR pipeline. **63 actions.**
 
-> For full param schemas, call `monolith_discover("material")` at runtime.
+> For full param schemas, call `describe_query("action_schema", target_namespace="material", target_action="<name>")` (or `monolith_discover("material", detail=true)`). Plain `monolith_discover("material")` is terse — names + one-line descriptions only.
 
 **Action categories:**
 
@@ -377,7 +377,7 @@ Animation curves, bone tracks, sync markers, root motion, compression, blend spa
 - **Inspection (1):** `get_animated_bone_transform` (FK-composed bone transform at a frame/time, component or world space).
 - **Extensions (no new actions):** `get_retargeter_info` now emits an `ops[]` array (per-op type + settings); `apply_anim_modifier` now accepts a `properties` reflective field set + a `persist` flag (register into the `AnimationModifiers` stack); `get_blend_space_info` now reports per-sample authored root-motion speed + `triangulation_baked` / `interpolate_using_grid`; `get_anim_node_pin_bindings` now also emits wire-linked input pins (`type:"Link"` with source node/pin); `derive_foot_sync_markers` gains a `from_bones` mode (foot plants from per-frame foot-bone height + planar-speed minima); `get_curve_keys` now reports `monotonic` + `sign` flags; `set_anim_node_function_binding` now calls `RequestRefreshExtensions` so the recompile regenerates the anim-subsystem set (prevents a null `NodeRelevancy` subsystem at runtime).
 
-> For full param schemas, call `monolith_discover("animation")` at runtime.
+> For full param schemas, call `describe_query("action_schema", target_namespace="animation", target_action="<name>")` (or `monolith_discover("animation", detail=true)`). Plain `monolith_discover("animation")` is terse — names + one-line descriptions only.
 
 **Action categories:**
 
@@ -414,7 +414,7 @@ See `Plugins/Monolith/Docs/specs/SPEC_MonolithAnimation.md` for the deep dive.
 
 Niagara VFX system editing — emitters, modules, params, renderers, HLSL, dynamic inputs, event handlers, sim stages, NPC, effect types, temporal control, stateless-emitter factory. **129 actions** (108 baseline + 1 layout + 9 temporal-control + 1 stateless-emitter factory + 7 issue #64 Tranche 2 search + 2 PR #65 CustomHlsl-text read/write).
 
-> For full param schemas, call `monolith_discover("niagara")` at runtime.
+> For full param schemas, call `describe_query("action_schema", target_namespace="niagara", target_action="<name>")` (or `monolith_discover("niagara", detail=true)`). Plain `monolith_discover("niagara")` is terse — names + one-line descriptions only.
 
 **Action categories:**
 
@@ -486,7 +486,7 @@ Check compile status: `compiling`, `last_result`, `last_compile_time`, `errors_s
 
 ### `editor.get_build_summary` · `editor.search_build_output` · `editor.get_compile_output`
 
-Build summary, search-build-log-by-pattern, structured compile report. See `monolith_discover("editor")` for params.
+Build summary, search-build-log-by-pattern, structured compile report. See `describe_query("action_schema", target_namespace="editor", target_action="<name>")` for params.
 
 ### `editor.get_recent_logs` · `editor.search_logs` · `editor.tail_log` · `editor.get_log_categories` · `editor.get_log_stats`
 
@@ -826,7 +826,7 @@ Unreal Engine C++ source code navigation. 1M+ symbols indexed. **12 actions** (1
 
 Mesh inspection, scene manipulation, spatial queries, level blockout, GeometryScript, procedural geometry, lighting, audio, performance, mesh import (incl. skeletal + animation, PR #58), and **experimental** procedural town generation. **194 actions** (always registered, in the public count) + 45 experimental town gen (gated on `bEnableProceduralTownGen=true`, default `false`) = 239 when town-gen is on.
 
-> For full param schemas, call `monolith_discover("mesh")` at runtime. The action surface is too broad for full enumeration — see categories below.
+> For full param schemas, call `describe_query("action_schema", target_namespace="mesh", target_action="<name>")` (or `monolith_discover("mesh", detail=true)`). Plain `monolith_discover("mesh")` is terse — names + one-line descriptions only. The action surface is too broad for full enumeration — see categories below.
 
 **Action categories (core, always registered):**
 
@@ -873,7 +873,7 @@ See `Plugins/Monolith/Docs/specs/SPEC_MonolithMesh.md` for the full action catal
 
 UMG widget Blueprint CRUD, templates, styling, animation (v1 + v2), the schema-driven **Spec / EffectSurface** architecture, settings scaffolding, accessibility, **CommonUI**, and GAS UI bindings. **138 actions** — the UMG + Spec/EffectSurface baseline (66 always-on, incl. the v0.15.0 navigation/conversion gap-closure + headline scaffolders) + 51 CommonUI (registered when `WITH_COMMONUI=1`) + 4 GAS UI binding aliases. The four CommonUI-surface gap-closure actions (`convert_border_to_common`, `convert_textblock_to_common`, `set_action_bar_button_class`, `apply_token_binding`) are `#if WITH_COMMONUI`-gated.
 
-> For full param schemas, call `monolith_discover("ui")` at runtime. The surface is large — categories below; the v0.15.0-new actions are flagged.
+> For full param schemas, call `describe_query("action_schema", target_namespace="ui", target_action="<name>")` (or `monolith_discover("ui", detail=true)`). Plain `monolith_discover("ui")` is terse — names + one-line descriptions only. The surface is large — categories below; the v0.15.0-new actions are flagged.
 
 **Action categories (UMG + Spec baseline, always registered):**
 
@@ -930,7 +930,7 @@ See `Plugins/Monolith/Docs/specs/SPEC_MonolithUI.md` for the deep dive including
 
 Gameplay Ability System integration. **135 actions** across 11 categories — covers the full GAS authoring pipeline. **Conditional on `#if WITH_GBA`** — projects without the GameplayAbilities plugin register 0 GAS actions.
 
-> For full param schemas, call `monolith_discover("gas")` at runtime.
+> For full param schemas, call `describe_query("action_schema", target_namespace="gas", target_action="<name>")` (or `monolith_discover("gas", detail=true)`). Plain `monolith_discover("gas")` is terse — names + one-line descriptions only.
 
 **Action categories:**
 
@@ -950,7 +950,7 @@ Gameplay Ability System integration. **135 actions** across 11 categories — co
 
 ### `gas.grant_ability_to_pawn` · NEW in Phase J F8
 
-Grant a `UGameplayAbility` to a pawn's `UAbilitySystemComponent` directly without scaffold-side wiring or `apply_effect` ceremony. See `monolith_discover("gas")` for params.
+Grant a `UGameplayAbility` to a pawn's `UAbilitySystemComponent` directly without scaffold-side wiring or `apply_effect` ceremony. See `describe_query("action_schema", target_namespace="gas", target_action="grant_ability_to_pawn")` for params.
 
 See `Plugins/Monolith/Docs/specs/SPEC_MonolithGAS.md` for the deep dive.
 
@@ -991,7 +991,7 @@ Behavior Trees, State Trees, EQS, Blackboards, AI Controllers, Perception, Smart
 
 **Conditional on `#if WITH_STATETREE` + `#if WITH_SMARTOBJECTS`** — projects missing either plugin register 0 AI actions.
 
-> For full param schemas, call `monolith_discover("ai")` at runtime.
+> For full param schemas, call `describe_query("action_schema", target_namespace="ai", target_action="<name>")` (or `monolith_discover("ai", detail=true)`). Plain `monolith_discover("ai")` is terse — names + one-line descriptions only.
 
 **Action categories:**
 
@@ -1021,7 +1021,7 @@ See `Plugins/Monolith/Docs/specs/SPEC_MonolithAI.md` for the deep dive — it's 
 
 Logic Driver Pro state machines: graph CRUD, node configuration, runtime PIE control, scaffolds, dialogue, text graph extraction. **66 actions.** **Conditional on `#if WITH_LOGICDRIVER`** — requires the Logic Driver Pro marketplace plugin. Reflection-only (precompiled marketplace plugin).
 
-> For full param schemas, call `monolith_discover("logicdriver")` at runtime.
+> For full param schemas, call `describe_query("action_schema", target_namespace="logicdriver", target_action="<name>")` (or `monolith_discover("logicdriver", detail=true)`). Plain `monolith_discover("logicdriver")` is terse — names + one-line descriptions only.
 
 **Action categories:**
 
@@ -1051,7 +1051,7 @@ See `Plugins/Monolith/Docs/specs/SPEC_MonolithLogicDriver.md`.
 
 Sound Cue + MetaSound graph CRUD + on-disk document introspection, attenuation/class/mix/submix/concurrency, batch ops, Sound Cue templates, perception bindings, and a small batch of test helpers. **98 actions.**
 
-> For full param schemas, call `monolith_discover("audio")` at runtime. MetaSound graph + document actions are conditional on `#if WITH_METASOUND` — projects without MetaSound get Sound Cue + CRUD + batch actions but no MetaSound graph building or document walk. The 12 document-introspection actions (PR #18, v0.14.10) read **on-disk document state** for arbitrary assets without an active builder session — distinct from the Builder-side graph actions which read live builder state during mutation.
+> For full param schemas, call `describe_query("action_schema", target_namespace="audio", target_action="<name>")` (or `monolith_discover("audio", detail=true)`). Plain `monolith_discover("audio")` is terse — names + one-line descriptions only. MetaSound graph + document actions are conditional on `#if WITH_METASOUND` — projects without MetaSound get Sound Cue + CRUD + batch actions but no MetaSound graph building or document walk. The 12 document-introspection actions (PR #18, v0.14.10) read **on-disk document state** for arbitrary assets without an active builder session — distinct from the Builder-side graph actions which read live builder state during mutation.
 
 **Action categories:**
 
@@ -1660,9 +1660,10 @@ generate_floor_plan → create_building_from_grid → generate_facade → genera
 Before writing any client code:
 
 1. `monolith_discover()` — list all namespaces and their actions.
-2. `monolith_discover("<namespace>")` — get full param schemas for one namespace.
-3. `project_query("search", {query: "..."})` — find assets by name/type.
-4. `source_query("search_source", {query: "..."})` — verify UE 5.7 API signatures.
+2. `monolith_discover("<namespace>")` — list one namespace's action names + one-line descriptions (terse). Pass `detail=true` to inline all param schemas.
+3. `describe_query("action_schema", target_namespace="<ns>", target_action="<name>")` — get one action's full param schema.
+4. `project_query("search", {query: "..."})` — find assets by name/type.
+5. `source_query("search_source", {query: "..."})` — verify UE 5.7 API signatures.
 
 **Golden rule:** never fabricate action names. The cogitator will be displeased.
 

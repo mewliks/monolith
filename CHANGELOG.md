@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Terse-by-default `monolith_discover(namespace)`.** The per-namespace branch now returns each action's name + a one-line description only — the full per-action `params` JSON-Schema is no longer emitted by default. Fetch a single action's schema with `describe_query action_schema` (~54 tokens), or pass `detail=true` (alias `verbose=true`) to inline every action's schema (reproduces the pre-change response shape byte-for-byte). New optional params: `filter` (case-insensitive substring on action name OR full description) and opt-in `offset`/`limit` pagination (`limit=0` = the complete list; no action is hidden by default). Terse responses carry top-level `total` (always), `next_offset` (only when a positive `limit` leaves more), and `schema_hint` (points callers at `describe_query action_schema` / `detail=true`). The one-line description is trimmed to its first sentence, else hard-capped at 150 chars on a word boundary with a trailing `"..."`; the full description is preserved in `detail` mode and via `describe_query action_schema`. The full `discover()` (no namespace) response is unchanged. Measured per-namespace token reduction (terse vs `detail`, same-server baseline):
+
+  | namespace | detail (baseline) | terse | reduction |
+  |-----------|-------------------|-------|-----------|
+  | blueprint | 24,521 | 4,027 | 83.6% |
+  | animation | 36,236 | 6,682 | 81.6% |
+  | ui | 20,590 | 4,944 | 76.0% |
+  | ai | 20,157 | 5,588 | 72.3% |
+
 - **Surgical nested-path UPROPERTY writer (`blueprint`) — `set_property_at_path`.** Sets a single value deep inside a CDO / UObject asset addressed by a dotted+bracket path — `Standing.Gaits[Jog].Starts.Forward` (`.` = struct member, `[N]` = array index, `[Key]` = map key, the key imported through the map's key grammar so enum names / ints / FName / string keys all resolve). Unlike `set_cdo_properties` (which rebuilds whole arrays/maps from a JSON tree) the write is in place, leaving sibling elements / keys untouched. Leaf values accept scalars, enum names, ImportText struct literals, hard object refs, and `TSoftObjectPtr` asset paths, identical to `set_cdo_property`. The write goes through the engine edit cradle (FProperty reflection, not the editor's edit-flag gate), so it writes `EditDefaultsOnly` DataAsset fields the editor refuses on saved instances. `create_missing_keys` adds an absent map key; `dry_run` resolves + validates without mutating; `save` persists the package to disk. Backed by a new generic `FMonolithReflectionWalker::ResolvePath` path resolver in `MonolithCore`.
 
 - **Retarget pose + op-stack tuning (`animation`) — 8 new actions.** Author the IK Retargeter retarget pose and the per-chain / root / foot-lock op settings, plus per-bone `USkeleton` translation-retargeting, so a retarget can be dialed in rather than left at op-stack defaults.
