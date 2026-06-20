@@ -108,6 +108,17 @@ $TempDir = Join-Path $env:TEMP "Monolith_Release_$Version"
 # UBT is invoked directly (the exe, not Build.bat) -- the prior single-engine script did
 # the same, and the exe lives at the same relative path under every UE 5.x install.
 $LegacyZip = Join-Path $ProjectDir "Monolith-v$Version.zip"  # legacy bridge (= UE5.7 copy)
+
+# --- Non-Monolith prototyping plugins to temporarily DISABLE during each engine's release
+#     build. The dev-master project also hosts gameplay-prototyping siblings (HordeForge,
+#     OptimizedGASP) OUTSIDE Plugins/Monolith. The editor target compiles them too, so a
+#     -DisableUnity compile error in a sibling (e.g. HordeForge's unity-leak: a log category
+#     used without its declaring header) would abort the Monolith release -- which must NOT
+#     be hostage to sibling compile health. We disable these for the build, then restore the
+#     EXACT original .uproject bytes (see Disable-ProjectPlugins / the build wrapper).
+#     FIVEPOINT8 does not contain these, so the toggle is a harmless no-op there.
+$ExcludeProjectPlugins = @('HordeForge', 'OptimizedGASP')
+
 $EngineMatrix = @(
     [PSCustomObject]@{
         Tag        = "UE5.7"                               # asset/marker engine tag
@@ -184,6 +195,41 @@ function Invoke-TouchBuildCs {
     Write-Host "    [$Tag] Touched $touched Build.cs file(s) to force clean recompile (anti stale-obj)" -ForegroundColor DarkGray
 }
 
+# Force every plugin in $ExcludeProjectPlugins to Enabled:false in the given .uproject so
+# the editor target does NOT compile those non-Monolith prototyping siblings during the
+# release build. They are EnabledByDefault and may not be listed in the Plugins array, so
+# we ADD an explicit disabled entry; if already listed, we set Enabled:false on it. A
+# disabled entry for a plugin that does not exist under the project is harmless, so we add
+# unconditionally (FIVEPOINT8 has none of these -> the entries are inert there). The caller
+# is responsible for restoring the EXACT original bytes afterward (byte-exact backup).
+function Disable-ProjectPlugins {
+    param([string]$UProjectPath, [string[]]$PluginNames, [string]$Tag)
+
+    if (-not $PluginNames -or $PluginNames.Count -eq 0) { return }
+
+    $json = Get-Content $UProjectPath -Raw | ConvertFrom-Json
+    # Ensure a Plugins array exists (PSCustomObject from ConvertFrom-Json may lack it).
+    if (-not ($json.PSObject.Properties.Name -contains 'Plugins') -or $null -eq $json.Plugins) {
+        $json | Add-Member -NotePropertyName 'Plugins' -NotePropertyValue @() -Force
+    }
+    # Normalize to a mutable list of entries.
+    $plugins = @($json.Plugins)
+    foreach ($name in $PluginNames) {
+        $existing = $plugins | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+        if ($existing) {
+            $existing.Enabled = $false
+        } else {
+            $plugins += [PSCustomObject]@{ Name = $name; Enabled = $false }
+        }
+    }
+    $json.Plugins = $plugins
+    # Re-serialize. The original bytes are restored from the backup later regardless, so
+    # exact formatting here does not matter -- only that UBT reads valid JSON.
+    $out = $json | ConvertTo-Json -Depth 50
+    Set-Content -Path $UProjectPath -Value $out -Encoding utf8
+    Write-Host "    [$Tag] Temporarily disabled project plugin(s) for build: $($PluginNames -join ', ')" -ForegroundColor DarkGray
+}
+
 # Step 1 + 1a for ONE engine: release build (-DisableUnity) then the full-unity collision
 # gate. Both run with MONOLITH_RELEASE_BUILD=1. Any failure throws (aborts whole release).
 function Invoke-EngineBuild {
@@ -191,6 +237,15 @@ function Invoke-EngineBuild {
 
     $Tag = $Engine.Tag
     $UBT = $Engine.UBT
+
+    # Disable the non-Monolith prototyping siblings (HordeForge/OptimizedGASP) for BOTH the
+    # -DisableUnity build and the full-unity gate below -- the editor target compiles them
+    # and a sibling compile error must not abort the Monolith release. We snapshot the EXACT
+    # original .uproject bytes FIRST and restore them in the finally that wraps the whole
+    # build body, so a build/gate failure can never leave the project's .uproject mutated.
+    $UProjectBackup = [System.IO.File]::ReadAllBytes($Engine.UProject)
+    try {
+        Disable-ProjectPlugins -UProjectPath $Engine.UProject -PluginNames $ExcludeProjectPlugins -Tag $Tag
 
     # --- Step 1: Build with optional deps disabled ---
     Write-Host "`n  [$Tag 1/4] Building release binaries (optional deps OFF)..." -ForegroundColor Yellow
@@ -338,6 +393,15 @@ function Invoke-EngineBuild {
         Remove-Item Env:\MONOLITH_RELEASE_BUILD -ErrorAction SilentlyContinue
         Remove-Item $UnityLog -Force -ErrorAction SilentlyContinue
         Write-Host "    [$Tag] MONOLITH_RELEASE_BUILD unset" -ForegroundColor DarkGray
+    }
+    }
+    finally {
+        # Restore the EXACT original .uproject bytes (byte-for-byte), regardless of build or
+        # gate outcome -- so a failure (or success) never leaves the project's .uproject with
+        # the temporary plugin-disable edits. WriteAllBytes overwrites with the verbatim
+        # snapshot taken before any mutation, so formatting/encoding is preserved exactly.
+        [System.IO.File]::WriteAllBytes($Engine.UProject, $UProjectBackup)
+        Write-Host "    [$Tag] Restored original .uproject (byte-exact)" -ForegroundColor DarkGray
     }
 }
 
